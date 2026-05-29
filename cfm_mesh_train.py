@@ -2024,14 +2024,21 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
     tube_mode = bool(Config.MULTI_LEAD_TUBE)
     tube_leads = prediction_leads(Config)
     tube_center_idx = center_lead_index(Config)
+    mask_2d = mask_4d[0, 0, :h, :w].detach().cpu()
+    mask_np = mask_2d.numpy()
+    stream_tube_stats = tube_mode and tac_climatology is not None
+    tube_weekly7_stats = _empty_tac_stats(h, w) if stream_tube_stats else None
+    tube_lead_stats = (
+        {int(lead): _empty_tac_stats(h, w) for lead in tube_leads}
+        if stream_tube_stats else {}
+    )
+    tube_weekly7_samples = 0
 
     all_preds = []
     all_truth = []
     all_persist = []
     all_target_doys = []
     all_target_time_indices = []
-    all_tube_preds = []
-    all_tube_truth = []
     all_init_time_indices = []
 
     for sample_i in range(rank_sample_count):
@@ -2054,10 +2061,48 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
                               spatial_c_dev, vec_c_dev, global_fields_dev, mask_dev, device)
 
         if tube_mode:
-            all_tube_preds.append(pred[0, :, :h, :w].cpu())
-            all_tube_truth.append(y[:, :h, :w].cpu())
             all_preds.append(pred[0, tube_center_idx, :h, :w].cpu())
             all_truth.append(y[tube_center_idx, :h, :w].cpu())
+            if stream_tube_stats:
+                pred_tube_np = torch.nan_to_num(
+                    pred[0, :, :h, :w].float(), nan=0.0, posinf=0.0, neginf=0.0
+                ).cpu().numpy()
+                truth_tube_np = torch.nan_to_num(
+                    y[:, :h, :w].float(), nan=0.0, posinf=0.0, neginf=0.0
+                ).cpu().numpy()
+                persist_np = torch.nan_to_num(
+                    x_t[0, :h, :w].float(), nan=0.0, posinf=0.0, neginf=0.0
+                ).cpu().numpy()
+                lead_doys = [
+                    int(val_dataset.doy_values[int(t_idx) + int(lead)])
+                    for lead in tube_leads
+                ]
+                pred_mean = pred_tube_np.mean(axis=0, dtype=np.float32)
+                truth_mean = truth_tube_np.mean(axis=0, dtype=np.float32)
+                climo_mean = np.mean(
+                    [np.asarray(tac_climatology[doy], dtype=np.float32) for doy in lead_doys],
+                    axis=0,
+                    dtype=np.float32,
+                )
+                _accumulate_tac_stats_with_climo(
+                    tube_weekly7_stats,
+                    pred_mean,
+                    truth_mean,
+                    persist_np,
+                    climo_mean,
+                    mask_np,
+                )
+                for lead_pos, lead in enumerate(tube_leads):
+                    _accumulate_tac_stats(
+                        tube_lead_stats[int(lead)],
+                        pred_tube_np[lead_pos],
+                        truth_tube_np[lead_pos],
+                        persist_np,
+                        lead_doys[lead_pos],
+                        tac_climatology,
+                        mask_np,
+                    )
+                tube_weekly7_samples += 1
         else:
             all_preds.append(pred[0, 0, :h, :w].cpu())
             all_truth.append(y[0, :h, :w].cpu())
@@ -2073,8 +2118,6 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
     local_target_doys = torch.tensor(all_target_doys, dtype=torch.long)
     local_target_time_indices = torch.tensor(all_target_time_indices, dtype=torch.long)
     local_init_time_indices = torch.tensor(all_init_time_indices, dtype=torch.long)
-    local_tube_preds = torch.stack(all_tube_preds) if tube_mode else None
-    local_tube_truth = torch.stack(all_tube_truth) if tube_mode else None
 
     if ddp:
         local_preds = local_preds.to(device)
@@ -2083,9 +2126,6 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         local_target_doys = local_target_doys.to(device)
         local_target_time_indices = local_target_time_indices.to(device)
         local_init_time_indices = local_init_time_indices.to(device)
-        if tube_mode:
-            local_tube_preds = local_tube_preds.to(device)
-            local_tube_truth = local_tube_truth.to(device)
 
         gathered_preds = [torch.zeros_like(local_preds) for _ in range(world_size)]
         gathered_truth = [torch.zeros_like(local_truth) for _ in range(world_size)]
@@ -2097,9 +2137,6 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         gathered_init_time_indices = [
             torch.zeros_like(local_init_time_indices) for _ in range(world_size)
         ]
-        if tube_mode:
-            gathered_tube_preds = [torch.zeros_like(local_tube_preds) for _ in range(world_size)]
-            gathered_tube_truth = [torch.zeros_like(local_tube_truth) for _ in range(world_size)]
 
         dist.all_gather(gathered_preds, local_preds)
         dist.all_gather(gathered_truth, local_truth)
@@ -2107,9 +2144,6 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         dist.all_gather(gathered_target_doys, local_target_doys)
         dist.all_gather(gathered_target_time_indices, local_target_time_indices)
         dist.all_gather(gathered_init_time_indices, local_init_time_indices)
-        if tube_mode:
-            dist.all_gather(gathered_tube_preds, local_tube_preds)
-            dist.all_gather(gathered_tube_truth, local_tube_truth)
 
         all_preds = torch.cat(gathered_preds, dim=0).cpu()
         all_truth = torch.cat(gathered_truth, dim=0).cpu()
@@ -2117,9 +2151,6 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         all_target_doys = torch.cat(gathered_target_doys, dim=0).cpu().numpy()
         all_target_time_indices = torch.cat(gathered_target_time_indices, dim=0).cpu().numpy()
         all_init_time_indices = torch.cat(gathered_init_time_indices, dim=0).cpu().numpy()
-        if tube_mode:
-            all_tube_preds = torch.cat(gathered_tube_preds, dim=0).cpu()
-            all_tube_truth = torch.cat(gathered_tube_truth, dim=0).cpu()
     else:
         all_preds = local_preds.cpu()
         all_truth = local_truth.cpu()
@@ -2127,9 +2158,15 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         all_target_doys = local_target_doys.cpu().numpy()
         all_target_time_indices = local_target_time_indices.cpu().numpy()
         all_init_time_indices = local_init_time_indices.cpu().numpy()
-        if tube_mode:
-            all_tube_preds = local_tube_preds.cpu()
-            all_tube_truth = local_tube_truth.cpu()
+
+    if stream_tube_stats and ddp:
+        _ddp_reduce_tac_stats_in_place(tube_weekly7_stats, device=device, dst=0)
+        for lead in tube_leads:
+            _ddp_reduce_tac_stats_in_place(tube_lead_stats[int(lead)], device=device, dst=0)
+        sample_count_tensor = torch.tensor([float(tube_weekly7_samples)], device=device, dtype=torch.float64)
+        dist.reduce(sample_count_tensor, dst=0, op=dist.ReduceOp.SUM)
+        if is_main_process():
+            tube_weekly7_samples = int(round(float(sample_count_tensor.item())))
 
     if not is_main_process():
         return 0.0, 0.0, 0.0, {}
@@ -2141,7 +2178,6 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
     all_truth = torch.nan_to_num(all_truth, nan=0.0, posinf=0.0, neginf=0.0)
     all_persist = torch.nan_to_num(all_persist, nan=0.0, posinf=0.0, neginf=0.0)
 
-    mask_2d = mask_4d[0, 0, :h, :w].cpu()
     all_preds_eval = restore_full_field_from_anomaly(
         all_preds, all_target_doys, tac_climatology, mask_2d
     )
@@ -2197,48 +2233,15 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
             all_persist, all_truth_eval, all_target_doys, tac_climatology, mask_2d
         )
         if tube_mode:
-            weekly7_stats = _empty_tac_stats(h, w)
-            lead_stats = {int(lead): _empty_tac_stats(h, w) for lead in tube_leads}
-            tube_pred_np = torch.nan_to_num(all_tube_preds, nan=0.0, posinf=0.0, neginf=0.0).numpy()
-            tube_truth_np = torch.nan_to_num(all_tube_truth, nan=0.0, posinf=0.0, neginf=0.0).numpy()
-            persist_nhw = all_persist[:, 0].numpy()
-            for i, init_time_idx in enumerate(all_init_time_indices):
-                lead_doys = [
-                    int(val_dataset.doy_values[int(init_time_idx) + int(lead)])
-                    for lead in tube_leads
-                ]
-                pred_mean = tube_pred_np[i].mean(axis=0, dtype=np.float32)
-                truth_mean = tube_truth_np[i].mean(axis=0, dtype=np.float32)
-                climo_mean = np.mean(
-                    [np.asarray(tac_climatology[doy], dtype=np.float32) for doy in lead_doys],
-                    axis=0,
-                    dtype=np.float32,
-                )
-                _accumulate_tac_stats_with_climo(
-                    weekly7_stats,
-                    pred_mean,
-                    truth_mean,
-                    persist_nhw[i],
-                    climo_mean,
-                    mask_2d.numpy(),
-                )
-                for lead_pos, lead in enumerate(tube_leads):
-                    _accumulate_tac_stats(
-                        lead_stats[int(lead)],
-                        tube_pred_np[i, lead_pos],
-                        tube_truth_np[i, lead_pos],
-                        persist_nhw[i],
-                        lead_doys[lead_pos],
-                        tac_climatology,
-                        mask_2d.numpy(),
-                    )
-            weekly7_samples = int(tube_pred_np.shape[0])
+            weekly7_stats = tube_weekly7_stats
+            lead_stats = tube_lead_stats
+            weekly7_samples = int(tube_weekly7_samples)
             for lead in tube_leads:
-                lm, lp, _, _ = summarize_tac_stats(lead_stats[int(lead)], mask_2d.numpy())
+                lm, lp, _, _ = summarize_tac_stats(lead_stats[int(lead)], mask_np)
                 per_lead_tac[int(lead)] = lm
                 per_lead_persistence_tac[int(lead)] = lp
                 per_lead_mse[int(lead)] = mse_from_tac_stats(
-                    lead_stats[int(lead)], mask_2d.numpy(), persistence=False
+                    lead_stats[int(lead)], mask_np, persistence=False
                 )
         else:
             pred_nhw = all_preds_eval[:, 0].numpy()
@@ -2350,6 +2353,15 @@ def _empty_tac_stats(h, w):
         "persist_truth_sum": np.zeros((h, w), dtype=np.float64),
         "count": np.zeros((h, w), dtype=np.float64),
     }
+
+
+def _ddp_reduce_tac_stats_in_place(stats, device, dst=0):
+    """Sum compact TAC sufficient-stat arrays across DDP ranks without gathering maps."""
+    for key in STAT_KEYS:
+        tensor = torch.from_numpy(stats[key]).to(device=device)
+        dist.reduce(tensor, dst=dst, op=dist.ReduceOp.SUM)
+        if is_main_process():
+            stats[key][...] = tensor.cpu().numpy()
 
 
 def _accumulate_tac_stats_with_climo(stats, pred, truth, persist, climo, mask_np):
