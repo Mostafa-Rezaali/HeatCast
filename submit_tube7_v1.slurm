@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=tube7_v1
-#SBATCH --output=tube7_v1_%j.log
-#SBATCH --error=tube7_v1_%j.err
+#SBATCH --job-name=tube7_grad_pair
+#SBATCH --output=tube7_grad_pair_%j.log
+#SBATCH --error=tube7_grad_pair_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=500G
@@ -9,6 +9,7 @@
 #SBATCH --partition=hpg-b200
 #SBATCH --qos=nessie
 #SBATCH --gres=gpu:8
+#SBATCH --exclude=c1003a-s15
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=mostafarezaali@ufl.edu
 
@@ -22,8 +23,14 @@ PYTHON_EXE=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 
 WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
 SCRIPT=${WORK_DIR}/cfm_mesh_train.py
-RUN_SUFFIX=tube7_v1
+
+# Matched fold-2 pair:
+#   control   grad=0.00
+#   treatment grad=0.10
+# Everything else is held fixed so the difference is attributable to gradient loss.
 FOLDS=${FOLDS:-"2"}
+GRADIENT_WEIGHTS=${GRADIENT_WEIGHTS:-"0.00 0.10"}
+CLEAN_START=${CLEAN_START:-1}
 
 cd "$WORK_DIR" || exit 1
 
@@ -49,121 +56,132 @@ unset CUDA_VISIBLE_DEVICES
 rm -rf /dev/shm/cfm_cache
 
 for FOLD in $FOLDS; do
-    RUN_NAME=cvfold${FOLD}_${RUN_SUFFIX}
+    for GRAD_WEIGHT in $GRADIENT_WEIGHTS; do
+        case "$GRAD_WEIGHT" in
+            0|0.0|0.00) GRAD_TAG=grad000 ;;
+            0.05|.05) GRAD_TAG=grad005 ;;
+            0.10|.10) GRAD_TAG=grad010 ;;
+            *) GRAD_TAG=grad$(echo "$GRAD_WEIGHT" | tr -d '0.') ;;
+        esac
 
-    echo "============================================================"
-    echo "Training tube diagnostic fold $FOLD"
-    echo "Run name: $RUN_NAME"
-    echo "Prediction leads: 12,13,14,15,16,17,18"
-    echo "============================================================"
+        RUN_SUFFIX=tube7_daily_${GRAD_TAG}
+        RUN_NAME=cvfold${FOLD}_${RUN_SUFFIX}
 
-    rm -rf /dev/shm/cfm_cache
-    rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}.pth
-    rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_tac.pth
-    rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_monitor.pth
-    rm -rf ${WORK_DIR}/checkpoints/${RUN_NAME}
-    rm -rf ${WORK_DIR}/test_prediction_plots/${RUN_NAME}
-    rm -f ${WORK_DIR}/hindcast_stats/hindcast_tac_stats_${RUN_NAME}_test.npz
-    rm -f ${WORK_DIR}/training_metrics/fold_epoch_metrics_${RUN_NAME}.csv
-    rm -f ${WORK_DIR}/data_cache/norm_stats_direct15_tube12-13-14-15-16-17-18_*.npz
-    rm -f ${WORK_DIR}/data_cache/local_daily_climo30_direct15_tube12-13-14-15-16-17-18_*.npy
+        echo "============================================================"
+        echo "Training matched tube diagnostic fold $FOLD"
+        echo "Run name: $RUN_NAME"
+        echo "Prediction leads: 12,13,14,15,16,17,18"
+        echo "Tube loss: 0.90 daily + 0.10 center + 0.00 weekly"
+        echo "Early-stop metric: daily center-lead TAC"
+        echo "Gradient loss weight: $GRAD_WEIGHT"
+        echo "============================================================"
 
-    $TORCHRUN --standalone --nproc_per_node=8 "$SCRIPT" \
-      --mode train \
-      --deterministic \
-      --multi_lead_tube \
-      --prediction_leads 12,13,14,15,16,17,18 \
-      --cv_fold "$FOLD" \
-      --run_name "$RUN_NAME" \
-      --epochs 30 \
-      --batch_size 1 \
-      --checkpoint_freq 1 \
-      --num_validation_samples 1088 \
-      --learning_rate 5e-5 \
-      --dropout 0.15 \
-      --warmup_epochs 10 \
-      --disable_anomaly_corr_loss \
-      --early_stop_metric tube_weekly7_tac \
-      --early_stop_patience 5 \
-      --early_stop_min_epoch 12 \
-      --early_stop_min_delta 0.0001
+        if [ "$CLEAN_START" = "1" ]; then
+            echo "Cleaning run-specific artifacts for $RUN_NAME"
+            rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}.pth
+            rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_tac.pth
+            rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_monitor.pth
+            rm -rf ${WORK_DIR}/checkpoints/${RUN_NAME}
+            rm -rf ${WORK_DIR}/test_prediction_plots/${RUN_NAME}
+            rm -f ${WORK_DIR}/hindcast_stats/hindcast_tac_stats_${RUN_NAME}_test.npz
+            rm -f ${WORK_DIR}/hindcast_stats/stitched_tac_${RUN_SUFFIX}.npz
+            rm -f ${WORK_DIR}/training_metrics/fold_epoch_metrics_${RUN_NAME}.csv
+            rm -f ${WORK_DIR}/hindcast_paper_data/hindcast_*_${RUN_NAME}_test.npz
+            rm -rf ${WORK_DIR}/paper_figures/${RUN_SUFFIX}
+        else
+            echo "CLEAN_START=0: preserving run-specific artifacts for $RUN_NAME"
+        fi
 
-    TRAIN_STATUS=$?
-    if [ $TRAIN_STATUS -ne 0 ]; then
-        echo "Training failed for fold $FOLD with exit code $TRAIN_STATUS"
-        exit $TRAIN_STATUS
-    fi
+        rm -rf /dev/shm/cfm_cache
 
-    CKPT=${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_monitor.pth
-    if [ ! -f "$CKPT" ]; then
-        echo "Missing best-monitor checkpoint: $CKPT"
-        echo "Falling back to best-TAC checkpoint."
-        CKPT=${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_tac.pth
-    fi
-    if [ ! -f "$CKPT" ]; then
-        echo "Missing best-TAC checkpoint; falling back to best-R2 checkpoint."
-        CKPT=${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}.pth
-    fi
-    if [ ! -f "$CKPT" ]; then
-        echo "Missing checkpoint after training: $CKPT"
-        exit 1
-    fi
+        $TORCHRUN --standalone --nproc_per_node=8 "$SCRIPT" \
+          --mode train \
+          --deterministic \
+          --multi_lead_tube \
+          --prediction_leads 12,13,14,15,16,17,18 \
+          --cv_fold "$FOLD" \
+          --run_name "$RUN_NAME" \
+          --epochs 30 \
+          --batch_size 1 \
+          --checkpoint_freq 1 \
+          --num_validation_samples 1088 \
+          --learning_rate 5e-5 \
+          --dropout 0.15 \
+          --warmup_epochs 10 \
+          --tube_loss_daily_weight 0.90 \
+          --tube_loss_center_weight 0.10 \
+          --tube_loss_weekly_weight 0.00 \
+          --gradient_loss_weight "$GRAD_WEIGHT" \
+          --disable_anomaly_corr_loss \
+          --early_stop_metric tac \
+          --early_stop_patience 5 \
+          --early_stop_min_epoch 12 \
+          --early_stop_min_delta 0.0001
 
-    echo "============================================================"
-    echo "Exporting tube fold $FOLD"
-    echo "Export checkpoint: $CKPT"
-    echo "============================================================"
+        TRAIN_STATUS=$?
+        if [ $TRAIN_STATUS -ne 0 ]; then
+            echo "Training failed for $RUN_NAME with exit code $TRAIN_STATUS"
+            exit $TRAIN_STATUS
+        fi
 
-    rm -rf /dev/shm/cfm_cache
+        CKPT=${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_monitor.pth
+        if [ ! -f "$CKPT" ]; then
+            echo "Missing best-monitor checkpoint: $CKPT"
+            echo "Falling back to best daily-TAC checkpoint."
+            CKPT=${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_tac.pth
+        fi
+        if [ ! -f "$CKPT" ]; then
+            echo "Missing best daily-TAC checkpoint; falling back to best-R2 checkpoint."
+            CKPT=${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}.pth
+        fi
+        if [ ! -f "$CKPT" ]; then
+            echo "Missing checkpoint after training: $CKPT"
+            exit 1
+        fi
 
-    $TORCHRUN --standalone --nproc_per_node=1 "$SCRIPT" \
-      --mode export_hindcast \
-      --deterministic \
-      --multi_lead_tube \
-      --prediction_leads 12,13,14,15,16,17,18 \
-      --cv_fold "$FOLD" \
-      --run_name "$RUN_NAME" \
-      --checkpoint "$CKPT" \
-      --hindcast_splits test
+        echo "============================================================"
+        echo "Exporting $RUN_NAME"
+        echo "Export checkpoint: $CKPT"
+        echo "============================================================"
 
-    EXPORT_STATUS=$?
-    if [ $EXPORT_STATUS -ne 0 ]; then
-        echo "Export failed for fold $FOLD with exit code $EXPORT_STATUS"
-        exit $EXPORT_STATUS
-    fi
+        rm -rf /dev/shm/cfm_cache
+
+        $TORCHRUN --standalone --nproc_per_node=1 "$SCRIPT" \
+          --mode export_hindcast \
+          --deterministic \
+          --multi_lead_tube \
+          --prediction_leads 12,13,14,15,16,17,18 \
+          --cv_fold "$FOLD" \
+          --run_name "$RUN_NAME" \
+          --checkpoint "$CKPT" \
+          --hindcast_splits test
+
+        EXPORT_STATUS=$?
+        if [ $EXPORT_STATUS -ne 0 ]; then
+            echo "Export failed for $RUN_NAME with exit code $EXPORT_STATUS"
+            exit $EXPORT_STATUS
+        fi
+
+        STAT_FILE=hindcast_stats/hindcast_tac_stats_${RUN_NAME}_test.npz
+        if [ -f "$STAT_FILE" ]; then
+            echo "============================================================"
+            echo "Daily TAC map diagnostics for $RUN_NAME"
+            echo "============================================================"
+            $PYTHON_EXE -u tac_skill_maps.py \
+              "$STAT_FILE" \
+              --metric daily \
+              --output_dir paper_figures/${RUN_SUFFIX} || exit 1
+        else
+            echo "Missing exported stat file: $STAT_FILE"
+            exit 1
+        fi
+    done
 done
-
-STAT_FILES=""
-for FOLD in $FOLDS; do
-    FILE=hindcast_stats/hindcast_tac_stats_cvfold${FOLD}_${RUN_SUFFIX}_test.npz
-    if [ -f "$FILE" ]; then
-        STAT_FILES="$STAT_FILES $FILE"
-    fi
-done
-if [ -n "$STAT_FILES" ]; then
-    echo "============================================================"
-    echo "Stitching available tube folds"
-    echo "============================================================"
-    $PYTHON_EXE -u stitch_hindcast_tac.py \
-      $STAT_FILES \
-      --output hindcast_stats/stitched_tac_${RUN_SUFFIX}.npz || exit 1
-
-    echo "============================================================"
-    echo "Tube weekly7 diagnostics"
-    echo "============================================================"
-    $PYTHON_EXE -u tac_skill_maps.py \
-      $STAT_FILES \
-      --metric weekly7 \
-      --output_dir paper_figures/${RUN_SUFFIX} || exit 1
-    $PYTHON_EXE -u summarize_hindcast_diagnostics.py \
-      $STAT_FILES \
-      --monthly_glob "hindcast_paper_data/hindcast_monthly_stats_cvfold*_${RUN_SUFFIX}_test.npz" \
-      --region_data paper_figures/${RUN_SUFFIX}/tac_skill_maps_data.npz || exit 1
-    $PYTHON_EXE -u compute_baselines.py \
-      $STAT_FILES \
-      --output_dir paper_figures/${RUN_SUFFIX} || exit 1
-fi
 
 echo "============================================================"
-echo "TUBE7 V1 COMPLETE"
+echo "MATCHED TUBE7 GRADIENT PAIR COMPLETE"
+echo "Compare:"
+echo "  training_metrics/fold_epoch_metrics_cvfold2_tube7_daily_grad000.csv"
+echo "  training_metrics/fold_epoch_metrics_cvfold2_tube7_daily_grad010.csv"
+echo "Accept grad010 only if daily TAC and gradient_ratio improve, with val MSE <= 1.05x grad000."
 echo "============================================================"
