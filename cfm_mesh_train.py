@@ -51,6 +51,10 @@ from icosahedral_mesh import IcosahedralMesh
 from mesh_backbone import MeshFlowNet, count_parameters
 from mode_dispatch import compute_loss, generate_sample
 import pickle
+try:
+    from publication_analysis_utils import region_masks as publication_region_masks
+except Exception:
+    publication_region_masks = None
 
 # ======================================================================================
 # Logger
@@ -287,6 +291,12 @@ class Config:
     TUBE_LOSS_WEEKLY_WEIGHT = 0.10
     TUBE_TEMPORAL_HEADS = 4
     GRADIENT_LOSS_WEIGHT = 0.0
+    ENABLE_EXCEEDANCE_HEAD = False
+    EXCEEDANCE_BCE_WEIGHT = 0.0
+    EXCEEDANCE_COUNT_WEIGHT = 0.0
+    EXCEEDANCE_POS_WEIGHT = 10.0
+    EXCEEDANCE_FOCAL_GAMMA = 0.0
+    EXCEEDANCE_INITIAL_PROB = 0.05
     ROLLOUT_STEPS = 1          # Single forward pass at inference
     CONDITION_DIM = 5
 
@@ -430,6 +440,8 @@ def early_stop_score(metric_name, improved_metrics, val_mse, val_ssim):
         return float(improved_metrics.get("mse_skill_vs_persistence", float("nan")))
     if metric_name == "spatial_anom_r2":
         return float(improved_metrics.get("spatial_anom_r2", float("nan")))
+    if metric_name == "exceedance_bss":
+        return float(improved_metrics.get("exceedance_bss", float("nan")))
     if metric_name == "ssim":
         return float(val_ssim)
     if metric_name == "val_mse":
@@ -462,6 +474,8 @@ def append_training_metrics(row):
         "weekly7_mse", "weekly7_persistence_mse",
         "tube_weekly7_tac", "tube_weekly7_persistence_tac", "tube_weekly7_n_samples",
         "tube_weekly7_mse", "tube_weekly7_persistence_mse",
+        "exceedance_bss", "exceedance_brier", "exceedance_climo_brier",
+        "exceedance_base_rate", "exceedance_pred_rate",
         "lead12_mse", "lead13_mse", "lead14_mse", "lead15_mse",
         "lead16_mse", "lead17_mse", "lead18_mse",
         "lead12_tac", "lead13_tac", "lead14_tac", "lead15_tac",
@@ -470,7 +484,8 @@ def append_training_metrics(row):
         "variance_ratio", "gradient_ratio", "extreme_bias", "correlation",
         "mae", "crps", "mse_skill_vs_persistence", "persistence_r2",
         "persistence_mae", "zero_r2", "train_base_mse",
-        "train_anomaly_corr_loss", "train_gradient_loss", "train_extreme_loss", "lr",
+        "train_anomaly_corr_loss", "train_gradient_loss", "train_exceedance_bce_loss",
+        "train_exceedance_count_loss", "train_extreme_loss", "lr",
         "early_stop_metric", "early_stop_value", "early_stop_best", "early_stop_failures",
     ]
     exists = os.path.exists(path)
@@ -632,6 +647,14 @@ def print_config_banner():
             f"{Config.TUBE_LOSS_DAILY_WEIGHT:.2f}*mean_daily_MSE + "
             f"{Config.TUBE_LOSS_CENTER_WEIGHT:.2f}*center_t+{Config.LEAD_TIME}_MSE + "
             f"{Config.TUBE_LOSS_WEEKLY_WEIGHT:.2f}*same_init_weekly7_MSE"
+        )
+    if Config.ENABLE_EXCEEDANCE_HEAD:
+        print(
+            "Exceedance head: ON "
+            f"(BCE weight={Config.EXCEEDANCE_BCE_WEIGHT:.2f}, "
+            f"count weight={Config.EXCEEDANCE_COUNT_WEIGHT:.2f}, "
+            f"pos_weight={Config.EXCEEDANCE_POS_WEIGHT:.2f}, "
+            f"focal_gamma={Config.EXCEEDANCE_FOCAL_GAMMA:.2f})"
         )
     if Config.USE_VALIDATION_PATIENCE:
         print(
@@ -1322,6 +1345,143 @@ def load_or_build_train_climatology(shared_data, train_indices, norm_stats, conf
     return climo
 
 
+MJJAS_MONTHS = (5, 6, 7, 8, 9)
+
+
+def compute_month_array(time_values):
+    base = datetime(1981, 5, 1)
+    return np.array([
+        (base + timedelta(days=float(tv))).month
+        for tv in np.asarray(time_values)
+    ], dtype=np.int16)
+
+
+def _normalize_hi_np(field, norm_stats):
+    return (
+        np.asarray(field, dtype=np.float32) - float(norm_stats["hi_mean"])
+    ) / (float(norm_stats["hi_std"]) + 1e-8)
+
+
+def get_exceedance_stats_path(config=None):
+    if config is None:
+        config = Config
+    suffix = "_tube" + "-".join(str(x) for x in prediction_leads(config)) if getattr(config, "MULTI_LEAD_TUBE", False) else ""
+    fold = "-".join(str(int(x)) for x in getattr(config, "CV_TEST_OFFSETS", ()))
+    return os.path.join(
+        config.OUTPUT_DIR,
+        "data_cache",
+        f"month_q95_exceedance_direct15{suffix}_{cv_split_tag(config)}_fold{fold}.npz",
+    )
+
+
+def build_month_q95_exceedance_stats(shared_data, train_indices, norm_stats, config):
+    heat_index = shared_data["heat_index"]
+    time_values = np.asarray(shared_data["time_values"])
+    months = compute_month_array(time_values)
+    h, w = config.IMAGE_SIZE
+    land_mask = np.isfinite(np.asarray(heat_index[:, :, 0])) & (np.asarray(heat_index[:, :, 0]) != 0.0)
+    q95 = np.full((12, h, w), np.nan, dtype=np.float32)
+    base_rate = np.full((12, h, w), np.nan, dtype=np.float32)
+    train_t = np.asarray(train_indices, dtype=np.int64)
+
+    for month in MJJAS_MONTHS:
+        target_indices = []
+        for lead in prediction_leads(config):
+            idx = train_t + int(lead)
+            idx = idx[months[idx] == month]
+            if idx.size:
+                target_indices.append(idx)
+        if not target_indices:
+            continue
+        target_indices = np.concatenate(target_indices)
+        stack = _normalize_hi_np(np.asarray(heat_index[:, :, target_indices], dtype=np.float32), norm_stats)
+        stack[~land_mask, :] = np.nan
+        q = np.nanpercentile(stack, 95.0, axis=2).astype(np.float32)
+        q[~land_mask] = np.nan
+        q95[month] = q
+        exceed = stack > q[:, :, None]
+        valid = np.isfinite(stack) & np.isfinite(q[:, :, None])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rate = exceed.sum(axis=2).astype(np.float32) / np.maximum(valid.sum(axis=2), 1)
+        rate[~land_mask] = np.nan
+        base_rate[month] = rate.astype(np.float32)
+        mean_rate = float(np.nanmean(rate))
+        print(f"  Exceedance train build check month={month}: mean rate={mean_rate:.4f}")
+        if not (0.025 <= mean_rate <= 0.075):
+            raise RuntimeError(f"Train exceedance rate for month {month} is not near 5%: {mean_rate:.4f}")
+    return q95, base_rate
+
+
+def load_or_build_exceedance_stats(shared_data, train_indices, norm_stats, config, ddp=False):
+    path = get_exceedance_stats_path(config)
+    if is_main_process():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        stats_path = get_norm_stats_path(config)
+        cache_ok = os.path.exists(path)
+        if cache_ok and os.path.exists(stats_path):
+            cache_ok = os.path.getmtime(path) >= os.path.getmtime(stats_path)
+        if cache_ok:
+            print(f"Loading train-year-only exceedance q95/base-rate stats from {path}")
+        else:
+            print("Building train-year-only month-q95 exceedance stats...")
+            q95, base_rate = build_month_q95_exceedance_stats(shared_data, train_indices, norm_stats, config)
+            np.savez_compressed(
+                path,
+                q95_z=q95.astype(np.float32),
+                base_rate=base_rate.astype(np.float32),
+                cv_split=np.array(cv_split_tag(config), dtype=object),
+                cv_test_offsets=np.array(config.CV_TEST_OFFSETS, dtype=np.int16),
+                months=np.array(MJJAS_MONTHS, dtype=np.int8),
+                hi_mean=np.array(float(norm_stats["hi_mean"]), dtype=np.float32),
+                hi_std=np.array(float(norm_stats["hi_std"]), dtype=np.float32),
+            )
+            print(f"  Saved exceedance stats to {path}")
+    if ddp:
+        dist.barrier()
+    with np.load(path, allow_pickle=False) as data:
+        q95 = np.asarray(data["q95_z"], dtype=np.float32)
+        base_rate = np.asarray(data["base_rate"], dtype=np.float32)
+    if is_main_process():
+        for month in MJJAS_MONTHS:
+            print(f"  Exceedance q95 ready month={month}: base_rate={np.nanmean(base_rate[month]):.4f}")
+    return q95, base_rate
+
+
+def batch_exceedance_thresholds(t_indices, dataset, q95_z, device):
+    if q95_z is None:
+        return None
+    t_values = t_indices.detach().cpu().numpy().reshape(-1) if isinstance(t_indices, torch.Tensor) else np.asarray(t_indices).reshape(-1)
+    month_values = compute_month_array(dataset.time_values)
+    if Config.MULTI_LEAD_TUBE:
+        q = np.stack([
+            np.stack([
+                np.asarray(q95_z[int(month_values[int(t) + int(lead)])], dtype=np.float32)
+                for lead in prediction_leads(Config)
+            ], axis=0)
+            for t in t_values
+        ], axis=0)
+        return torch.from_numpy(q).to(device=device, non_blocking=True)
+    q = np.stack([
+        np.asarray(q95_z[int(month_values[int(t) + int(Config.LEAD_TIME)])], dtype=np.float32)
+        for t in t_values
+    ], axis=0)
+    return torch.from_numpy(q).unsqueeze(1).to(device=device, non_blocking=True)
+
+
+def build_exceedance_region_mask_tensor(config, conus_mask):
+    mask_np = conus_mask.detach().cpu().numpy() > 0.5
+    masks = []
+    if publication_region_masks is not None:
+        try:
+            for _, region_mask in publication_region_masks(config.IMAGE_SIZE).items():
+                masks.append((region_mask & mask_np).astype(np.float32))
+        except Exception as exc:
+            print(f"  Region masks unavailable for exceedance count loss; using CONUS only ({exc}).")
+    if not masks:
+        masks = [mask_np.astype(np.float32)]
+    return torch.from_numpy(np.stack(masks, axis=0).astype(np.float32))
+
+
 def restore_full_field_from_anomaly(field, target_doys, climo_by_doy, mask=None):
     if (
         not Config.TRAIN_ON_CLIMATOLOGY_ANOMALIES
@@ -1951,7 +2111,7 @@ def predict_direct(model, x_t, x_tm1, x_tm2, spatial_c, vec_c, global_fields, ma
     """
     h, w = Config.IMAGE_SIZE
     if Config.DETERMINISTIC:
-        from mode_dispatch import _deterministic_input
+        from mode_dispatch import _deterministic_input, _set_exceedance_logits_from_prediction
         x_input = _deterministic_input(model, x_t, x_tm1, x_tm2, spatial_c)
         dummy_t = torch.full((x_t.shape[0],), 0.5, device=device)
         raw_pred = model(x_input, dummy_t, vec_c, global_fields=global_fields)
@@ -1960,6 +2120,7 @@ def predict_direct(model, x_t, x_tm1, x_tm2, spatial_c, vec_c, global_fields, ma
             pred = x_t + raw_pred
         else:
             pred = raw_pred
+        _set_exceedance_logits_from_prediction(model, pred)
         if pred.ndim == 4 and pred.shape[1] != mask.shape[1]:
             mask_for_pred = mask.expand_as(pred)
         elif pred.ndim == 5:
@@ -1998,7 +2159,9 @@ def predict_direct_ensemble(models, x_t, x_tm1, x_tm2, spatial_c, vec_c, global_
 @torch.inference_mode()
 def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
                                       n_samples=100, rank=0, world_size=1, ddp=False,
-                                      tac_climatology=None):
+                                      tac_climatology=None,
+                                      exceedance_q95=None,
+                                      exceedance_base_rate=None):
     """
     Validation via direct single-step prediction at LEAD_TIME=15.
     No autoregressive rollout. Each sample is one forward pass.
@@ -2051,6 +2214,19 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         if stream_tube_stats else {}
     )
     tube_weekly7_samples = 0
+    exceedance_enabled = (
+        bool(getattr(model, "enable_exceedance_head", False))
+        and exceedance_q95 is not None
+        and exceedance_base_rate is not None
+    )
+    exceedance_sums = {
+        "model_brier": 0.0,
+        "climo_brier": 0.0,
+        "count": 0.0,
+        "truth_pos": 0.0,
+        "pred_sum": 0.0,
+    }
+    month_values = compute_month_array(val_dataset.time_values) if exceedance_enabled else None
 
     all_preds = []
     all_truth = []
@@ -2081,6 +2257,7 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         if tube_mode:
             all_preds.append(pred[0, tube_center_idx, :h, :w].cpu())
             all_truth.append(y[tube_center_idx, :h, :w].cpu())
+            center_truth_for_exceedance = y[tube_center_idx, :h, :w]
             if stream_tube_stats:
                 pred_tube_np = torch.nan_to_num(
                     pred[0, :, :h, :w].float(), nan=0.0, posinf=0.0, neginf=0.0
@@ -2124,6 +2301,30 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         else:
             all_preds.append(pred[0, 0, :h, :w].cpu())
             all_truth.append(y[0, :h, :w].cpu())
+            center_truth_for_exceedance = y[0, :h, :w]
+        if exceedance_enabled:
+            logits = getattr(model, "last_exceedance_logits", None)
+            if logits is None:
+                raise RuntimeError("Exceedance validation requested, but last_exceedance_logits is missing.")
+            if tube_mode:
+                center_logits = logits[0, tube_center_idx, :h, :w]
+            else:
+                center_logits = logits[0, 0, :h, :w]
+            target_month = int(month_values[int(t_idx) + int(Config.LEAD_TIME)])
+            q = torch.from_numpy(np.asarray(exceedance_q95[target_month], dtype=np.float32)).to(device=device)
+            base = torch.from_numpy(np.asarray(exceedance_base_rate[target_month], dtype=np.float32)).to(device=device)
+            label = (center_truth_for_exceedance.to(device) > q).float()
+            prob = torch.sigmoid(center_logits.float())
+            valid = (mask_4d[0, 0] > 0.5) & torch.isfinite(q) & torch.isfinite(base)
+            if valid.any():
+                p = prob[valid].clamp(0.0, 1.0)
+                y_evt = label[valid]
+                b = base[valid].clamp(0.0, 1.0)
+                exceedance_sums["model_brier"] += float(((p - y_evt) ** 2).sum().item())
+                exceedance_sums["climo_brier"] += float(((b - y_evt) ** 2).sum().item())
+                exceedance_sums["count"] += float(p.numel())
+                exceedance_sums["truth_pos"] += float(y_evt.sum().item())
+                exceedance_sums["pred_sum"] += float(p.sum().item())
         all_persist.append(x_t[0, :h, :w].cpu())
         target_time_idx = int(t_idx) + int(Config.LEAD_TIME)
         all_init_time_indices.append(int(t_idx))
@@ -2185,6 +2386,27 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         dist.reduce(sample_count_tensor, dst=0, op=dist.ReduceOp.SUM)
         if is_main_process():
             tube_weekly7_samples = int(round(float(sample_count_tensor.item())))
+    if exceedance_enabled and ddp:
+        ex_tensor = torch.tensor(
+            [
+                exceedance_sums["model_brier"],
+                exceedance_sums["climo_brier"],
+                exceedance_sums["count"],
+                exceedance_sums["truth_pos"],
+                exceedance_sums["pred_sum"],
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        dist.reduce(ex_tensor, dst=0, op=dist.ReduceOp.SUM)
+        if is_main_process():
+            exceedance_sums = {
+                "model_brier": float(ex_tensor[0].item()),
+                "climo_brier": float(ex_tensor[1].item()),
+                "count": float(ex_tensor[2].item()),
+                "truth_pos": float(ex_tensor[3].item()),
+                "pred_sum": float(ex_tensor[4].item()),
+            }
 
     if not is_main_process():
         return 0.0, 0.0, 0.0, {}
@@ -2243,6 +2465,18 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
     per_lead_mse = {}
     per_lead_tac = {}
     per_lead_persistence_tac = {}
+    exceedance_brier = float("nan")
+    exceedance_climo_brier = float("nan")
+    exceedance_bss = float("nan")
+    exceedance_base_rate = float("nan")
+    exceedance_pred_rate = float("nan")
+    if exceedance_enabled:
+        n_ex = max(exceedance_sums["count"], 1.0)
+        exceedance_brier = exceedance_sums["model_brier"] / n_ex
+        exceedance_climo_brier = exceedance_sums["climo_brier"] / n_ex
+        exceedance_bss = 1.0 - exceedance_brier / (exceedance_climo_brier + 1e-8)
+        exceedance_base_rate = exceedance_sums["truth_pos"] / n_ex
+        exceedance_pred_rate = exceedance_sums["pred_sum"] / n_ex
     if tac_climatology is not None:
         tac = temporal_anomaly_correlation_from_climo(
             all_preds_eval, all_truth_eval, all_target_doys, tac_climatology, mask_2d
@@ -2311,6 +2545,12 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
                 for lead in tube_leads
             )
             print(f"  Per-lead diagnostics: {lead_text}")
+    if exceedance_enabled:
+        print(
+            f"  Exceedance BSS: model={exceedance_bss:+.4f}, "
+            f"Brier={exceedance_brier:.5f}, climo={exceedance_climo_brier:.5f}, "
+            f"event_rate={exceedance_base_rate:.4f}, pred_rate={exceedance_pred_rate:.4f}"
+        )
 
     return avg_mse, avg_rmse, avg_ssim, {
         'variance_ratio':    improved['variance_ratio'],
@@ -2341,6 +2581,11 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         'tube_weekly7_n_samples': weekly7_samples if tube_mode else 0,
         'tube_weekly7_mse': weekly7_mse if tube_mode else float("nan"),
         'tube_weekly7_persistence_mse': weekly7_persistence_mse if tube_mode else float("nan"),
+        'exceedance_bss': exceedance_bss,
+        'exceedance_brier': exceedance_brier,
+        'exceedance_climo_brier': exceedance_climo_brier,
+        'exceedance_base_rate': exceedance_base_rate,
+        'exceedance_pred_rate': exceedance_pred_rate,
         **{f"lead{int(lead)}_mse": per_lead_mse.get(int(lead), float("nan")) for lead in (12, 13, 14, 15, 16, 17, 18)},
         **{f"lead{int(lead)}_tac": per_lead_tac.get(int(lead), float("nan")) for lead in (12, 13, 14, 15, 16, 17, 18)},
     }
@@ -3578,6 +3823,12 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
     tac_climatology = load_or_build_train_climatology(
         shared_data, train_indices, norm_stats, Config, ddp=ddp
     )
+    exceedance_q95 = None
+    exceedance_base_rate = None
+    if Config.ENABLE_EXCEEDANCE_HEAD:
+        exceedance_q95, exceedance_base_rate = load_or_build_exceedance_stats(
+            shared_data, train_indices, norm_stats, Config, ddp=ddp
+        )
 
     train_dataset = ClimateDataset(Config, mode="train", train_indices=train_indices,
                                    normalization_stats=norm_stats, shared_data=shared_data,
@@ -3634,7 +3885,18 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
             Config.TUBE_LOSS_WEEKLY_WEIGHT,
         ),
         gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
+        enable_exceedance_head=Config.ENABLE_EXCEEDANCE_HEAD,
+        exceedance_initial_logit=math.log(
+            float(Config.EXCEEDANCE_INITIAL_PROB)
+            / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
+        ),
     ).to(device)
+    model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
+    model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
+    model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
+    model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
+    if Config.ENABLE_EXCEEDANCE_HEAD:
+        model.exceedance_region_masks = build_exceedance_region_mask_tensor(Config, conus_mask).to(device)
 
     if is_main_process():
         count_parameters(model)
@@ -3728,6 +3990,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
         epoch_base_mse_loss = 0.0
         epoch_anom_corr_loss = 0.0
         epoch_gradient_loss = 0.0
+        epoch_exceedance_bce_loss = 0.0
+        epoch_exceedance_count_loss = 0.0
         n_good_batches = 0
         consecutive_skips = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process(),
@@ -3762,17 +4026,28 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                exceedance_thresholds = (
+                    batch_exceedance_thresholds(t_indices, train_dataset, exceedance_q95, device)
+                    if Config.ENABLE_EXCEEDANCE_HEAD else None
+                )
                 loss, components = compute_loss(
                     model, fm, y, x_t, x_tm1, x_tm2,
                     spatial_c, vec_c, global_fields, mask,
-                    deterministic=Config.DETERMINISTIC)
+                    deterministic=Config.DETERMINISTIC,
+                    exceedance_thresholds=exceedance_thresholds)
 
                 base_mse_val = 0.0
                 anom_corr_val = 0.0
                 gradient_loss_val = 0.0
+                exceedance_bce_val = 0.0
+                exceedance_count_val = 0.0
                 grad_loss_for_loss = components.get('gradient_loss', None)
                 if grad_loss_for_loss is not None:
                     gradient_loss_val = grad_loss_for_loss.item()
+                if components.get('exceedance_bce_loss', None) is not None:
+                    exceedance_bce_val = components['exceedance_bce_loss'].item()
+                if components.get('exceedance_count_loss', None) is not None:
+                    exceedance_count_val = components['exceedance_count_loss'].item()
                 if 'recon_mse' in components:
                     base_mse_val = components['recon_mse'].item()
                 if Config.MULTI_LEAD_TUBE and 'tube_daily_mse' in components:
@@ -3860,6 +4135,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
             epoch_base_mse_loss += base_mse_val
             epoch_anom_corr_loss += anom_corr_val
             epoch_gradient_loss += gradient_loss_val
+            epoch_exceedance_bce_loss += exceedance_bce_val
+            epoch_exceedance_count_loss += exceedance_count_val
             epoch_extreme_loss += ext_loss_val
             n_good_batches += 1
 
@@ -3870,6 +4147,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     postfix["ac"] = f"{anom_corr_val:.4f}"
                 if Config.GRADIENT_LOSS_WEIGHT > 0.0:
                     postfix["grad"] = f"{gradient_loss_val:.4f}"
+                if Config.ENABLE_EXCEEDANCE_HEAD:
+                    postfix["bce"] = f"{exceedance_bce_val:.4f}"
                 if Config.USE_EXTREME_LOSS:
                     postfix["ext"] = f"{ext_loss_val:.4f}"
                 pbar.set_postfix(postfix)
@@ -3898,7 +4177,9 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     tac_climatology
                     if (is_main_process() or Config.MULTI_LEAD_TUBE)
                     else None
-                )
+                ),
+                exceedance_q95=exceedance_q95 if Config.ENABLE_EXCEEDANCE_HEAD else None,
+                exceedance_base_rate=exceedance_base_rate if Config.ENABLE_EXCEEDANCE_HEAD else None,
             )
 
             current_r2 = improved_metrics.get('r2', -999.0) if improved_metrics else -999.0
@@ -3915,6 +4196,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                 avg_base_mse = epoch_base_mse_loss / max(n_good_batches, 1)
                 avg_anom_corr = epoch_anom_corr_loss / max(n_good_batches, 1)
                 avg_gradient = epoch_gradient_loss / max(n_good_batches, 1)
+                avg_exceedance_bce = epoch_exceedance_bce_loss / max(n_good_batches, 1)
+                avg_exceedance_count = epoch_exceedance_count_loss / max(n_good_batches, 1)
                 if Config.USE_ANOMALY_CORR_LOSS:
                     print(f"  Train Base MSE:    {avg_base_mse:.6f}")
                     print(f"  Anom Corr Loss:    {avg_anom_corr:.6f}")
@@ -3927,6 +4210,12 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     print(f"  Gradient Loss:     {avg_gradient:.6f}")
                 else:
                     avg_gradient = ""
+                if Config.ENABLE_EXCEEDANCE_HEAD:
+                    print(f"  Exceedance BCE:    {avg_exceedance_bce:.6f}")
+                    print(f"  Exceed Count Loss: {avg_exceedance_count:.6f}")
+                else:
+                    avg_exceedance_bce = ""
+                    avg_exceedance_count = ""
                 if Config.USE_EXTREME_LOSS:
                     avg_ext = epoch_extreme_loss / max(n_good_batches, 1)
                     print(f"  Extreme Loss:      {avg_ext:.6f}")
@@ -3952,6 +4241,10 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                 if Config.MULTI_LEAD_TUBE:
                     print(f"  Tube W7 TAC:       {improved_metrics['tube_weekly7_tac']:.4f}")
                     print(f"  Tube W7 Pers TAC:  {improved_metrics['tube_weekly7_persistence_tac']:.4f}")
+                if Config.ENABLE_EXCEEDANCE_HEAD:
+                    print(f"  Exceedance BSS:    {improved_metrics['exceedance_bss']:+.4f}")
+                    print(f"  Exceedance Brier:  {improved_metrics['exceedance_brier']:.5f}")
+                    print(f"  Exceedance Rate:   truth={improved_metrics['exceedance_base_rate']:.4f}, pred={improved_metrics['exceedance_pred_rate']:.4f}")
                 print(f"  MAE:               {improved_metrics['mae']:.4f}")
                 print(f"  CRPS:              {improved_metrics['crps']:.4f}")
                 print(f"  LR:                {scheduler.get_last_lr()[0]:.2e}")
@@ -4008,6 +4301,11 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     "tube_weekly7_n_samples": improved_metrics.get("tube_weekly7_n_samples", ""),
                     "tube_weekly7_mse": improved_metrics.get("tube_weekly7_mse", ""),
                     "tube_weekly7_persistence_mse": improved_metrics.get("tube_weekly7_persistence_mse", ""),
+                    "exceedance_bss": improved_metrics.get("exceedance_bss", ""),
+                    "exceedance_brier": improved_metrics.get("exceedance_brier", ""),
+                    "exceedance_climo_brier": improved_metrics.get("exceedance_climo_brier", ""),
+                    "exceedance_base_rate": improved_metrics.get("exceedance_base_rate", ""),
+                    "exceedance_pred_rate": improved_metrics.get("exceedance_pred_rate", ""),
                     **{f"lead{lead}_mse": improved_metrics.get(f"lead{lead}_mse", "") for lead in (12, 13, 14, 15, 16, 17, 18)},
                     **{f"lead{lead}_tac": improved_metrics.get(f"lead{lead}_tac", "") for lead in (12, 13, 14, 15, 16, 17, 18)},
                     "spatial_anom_r2": improved_metrics["spatial_anom_r2"],
@@ -4025,6 +4323,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     "train_base_mse": avg_base_mse,
                     "train_anomaly_corr_loss": avg_anom_corr,
                     "train_gradient_loss": avg_gradient,
+                    "train_exceedance_bce_loss": avg_exceedance_bce,
+                    "train_exceedance_count_loss": avg_exceedance_count,
                     "train_extreme_loss": avg_ext,
                     "lr": scheduler.get_last_lr()[0],
                     "early_stop_metric": Config.EARLY_STOP_METRIC,
@@ -4137,6 +4437,18 @@ def main():
                        help='Number of attention heads for temporal mesh attention in tube mode.')
     parser.add_argument('--gradient_loss_weight', type=float, default=None,
                        help='Blend weight for masked spatial finite-difference gradient loss.')
+    parser.add_argument('--enable_exceedance_head', action='store_true',
+                       help='Enable Stage 2 month-q95 exceedance logit head and exceedance validation.')
+    parser.add_argument('--exceedance_bce_weight', type=float, default=None,
+                       help='Loss weight for weighted/focal BCE on month-q95 exceedance labels.')
+    parser.add_argument('--exceedance_count_weight', type=float, default=None,
+                       help='Loss weight for regional exceedance-count fraction matching.')
+    parser.add_argument('--exceedance_pos_weight', type=float, default=None,
+                       help='Positive class weight for exceedance BCE.')
+    parser.add_argument('--exceedance_focal_gamma', type=float, default=None,
+                       help='Optional focal BCE gamma; 0 disables focal modulation.')
+    parser.add_argument('--exceedance_initial_prob', type=float, default=None,
+                       help='Initial exceedance-head probability bias.')
     parser.add_argument('--dry_run', action='store_true',
                        help='Run a tiny one-GPU smoke/proxy pass: 1 epoch, 2 train batches, 4 validation samples.')
     parser.add_argument('--epochs', type=int, default=None,
@@ -4160,7 +4472,7 @@ def main():
     parser.add_argument('--early_stop_patience', type=int, default=None,
                        help='Stop after this many validation checks without monitor improvement.')
     parser.add_argument('--early_stop_metric', type=str, default=None,
-                       choices=['tube_weekly7_tac', 'weekly7_tac', 'tac', 'r2', 'mse_skill', 'spatial_anom_r2', 'ssim', 'val_mse'],
+                       choices=['tube_weekly7_tac', 'weekly7_tac', 'tac', 'r2', 'mse_skill', 'spatial_anom_r2', 'exceedance_bss', 'ssim', 'val_mse'],
                        help='Validation metric used for patience; larger is better except val_mse is internally negated.')
     parser.add_argument('--early_stop_min_epoch', type=int, default=None,
                        help='Do not count patience failures before this epoch.')
@@ -4256,6 +4568,18 @@ def main():
         if args.gradient_loss_weight < 0.0 or args.gradient_loss_weight >= 1.0:
             raise ValueError("--gradient_loss_weight must be in [0, 1).")
         Config.GRADIENT_LOSS_WEIGHT = float(args.gradient_loss_weight)
+    if args.enable_exceedance_head:
+        Config.ENABLE_EXCEEDANCE_HEAD = True
+    if args.exceedance_bce_weight is not None:
+        Config.EXCEEDANCE_BCE_WEIGHT = float(args.exceedance_bce_weight)
+    if args.exceedance_count_weight is not None:
+        Config.EXCEEDANCE_COUNT_WEIGHT = float(args.exceedance_count_weight)
+    if args.exceedance_pos_weight is not None:
+        Config.EXCEEDANCE_POS_WEIGHT = float(args.exceedance_pos_weight)
+    if args.exceedance_focal_gamma is not None:
+        Config.EXCEEDANCE_FOCAL_GAMMA = float(args.exceedance_focal_gamma)
+    if args.exceedance_initial_prob is not None:
+        Config.EXCEEDANCE_INITIAL_PROB = float(args.exceedance_initial_prob)
     if args.mesh_level is not None:
         Config.MESH_REFINEMENT_LEVEL = args.mesh_level
     if args.mesh_rounds is not None:
@@ -4308,6 +4632,19 @@ def main():
         )
         if weight_sum <= 0.0:
             raise RuntimeError("Tube loss weights must sum to a positive value.")
+    if Config.ENABLE_EXCEEDANCE_HEAD:
+        if not Config.DETERMINISTIC:
+            raise RuntimeError("--enable_exceedance_head is deterministic-only for Stage 2.")
+        if Config.EXCEEDANCE_BCE_WEIGHT < 0.0 or Config.EXCEEDANCE_COUNT_WEIGHT < 0.0:
+            raise ValueError("Exceedance loss weights must be non-negative.")
+        if Config.EXCEEDANCE_POS_WEIGHT <= 0.0:
+            raise ValueError("--exceedance_pos_weight must be positive.")
+        if Config.EXCEEDANCE_FOCAL_GAMMA < 0.0:
+            raise ValueError("--exceedance_focal_gamma must be non-negative.")
+        if not (0.0 < Config.EXCEEDANCE_INITIAL_PROB < 1.0):
+            raise ValueError("--exceedance_initial_prob must be in (0, 1).")
+    if str(Config.EARLY_STOP_METRIC).lower() == "exceedance_bss" and not Config.ENABLE_EXCEEDANCE_HEAD:
+        raise RuntimeError("--early_stop_metric exceedance_bss requires --enable_exceedance_head.")
 
     set_random_seed(Config.SEED)
     apply_extended_global_fields()
@@ -4421,7 +4758,16 @@ def _load_meshflownet_checkpoint(checkpoint_path, mesh, device):
             Config.TUBE_LOSS_WEEKLY_WEIGHT,
         ),
         gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
+        enable_exceedance_head=Config.ENABLE_EXCEEDANCE_HEAD,
+        exceedance_initial_logit=math.log(
+            float(Config.EXCEEDANCE_INITIAL_PROB)
+            / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
+        ),
     ).to(device)
+    model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
+    model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
+    model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
+    model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get('ema_state_dict', checkpoint.get('model_state_dict'))
@@ -4615,7 +4961,16 @@ def _test(args):
             Config.TUBE_LOSS_WEEKLY_WEIGHT,
         ),
         gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
+        enable_exceedance_head=Config.ENABLE_EXCEEDANCE_HEAD,
+        exceedance_initial_logit=math.log(
+            float(Config.EXCEEDANCE_INITIAL_PROB)
+            / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
+        ),
     ).to(device)
+    model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
+    model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
+    model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
+    model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
 
     checkpoint = torch.load(Config.MODEL_SAVE_PATH, map_location=device)
     state_dict = checkpoint.get('ema_state_dict', checkpoint['model_state_dict'])

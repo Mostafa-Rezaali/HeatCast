@@ -351,6 +351,8 @@ class MeshFlowNet(nn.Module):
         tube_temporal_heads=4,
         tube_loss_weights=(0.80, 0.10, 0.10),
         gradient_loss_weight=0.0,
+        enable_exceedance_head=False,
+        exceedance_initial_logit=-2.9444389791664403,
     ):
         super().__init__()
         self.img_channels = img_channels
@@ -365,6 +367,8 @@ class MeshFlowNet(nn.Module):
         self.center_lead = 15 if 15 in self.prediction_leads else self.prediction_leads[self.tube_num_leads // 2]
         self.tube_loss_weights = tuple(float(x) for x in tube_loss_weights)
         self.gradient_loss_weight = float(gradient_loss_weight)
+        self.enable_exceedance_head = bool(enable_exceedance_head)
+        self.last_exceedance_logits = None
 
         if deterministic:
             grid_input_dim = spatial_cond_channels
@@ -441,6 +445,17 @@ class MeshFlowNet(nn.Module):
         )
         nn.init.zeros_(self.grid_refiner[-1].weight)
         nn.init.zeros_(self.grid_refiner[-1].bias)
+        if self.enable_exceedance_head:
+            self.exceedance_head = nn.Sequential(
+                nn.Conv2d(img_channels, refine_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
+                nn.Conv2d(refine_dim, refine_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(refine_dim, img_channels, kernel_size=3, padding=1),
+            )
+            nn.init.zeros_(self.exceedance_head[-1].weight)
+            nn.init.constant_(self.exceedance_head[-1].bias, float(exceedance_initial_logit))
         self._mesh = mesh
 
     def set_mesh(self, mesh):
@@ -455,6 +470,7 @@ class MeshFlowNet(nn.Module):
         """
         mesh = self._mesh
         assert mesh is not None, "Call set_mesh() before forward()"
+        self.last_exceedance_logits = None
 
         B = x.shape[0]
         H, W = self.image_size
