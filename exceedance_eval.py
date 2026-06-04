@@ -21,7 +21,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -700,7 +700,13 @@ class MarginMonotonicCalibrator:
         if not np.any(valid):
             return out
         score = (mu_z[valid] - q95[valid]) / np.maximum(sigma[valid], 0.1)
-        out[valid] = self.predict_scores(score, np.full(score.shape, int(month), dtype=np.int16))
+        pred = self.predict_scores(score, np.full(score.shape, int(month), dtype=np.int16))
+        if pred.shape != score.shape or not np.all(np.isfinite(pred)):
+            raise RuntimeError(
+                f"{self.method} calibrator produced non-finite or misaligned probabilities "
+                f"for month={month}: pred_shape={pred.shape}, score_shape={score.shape}"
+            )
+        out[valid] = pred
         return out
 
     def coefficient_rows(self) -> List[Dict[str, object]]:
@@ -813,10 +819,134 @@ def choose_monotonic_calibrator(
     )
 
 
+def score_calibrator_on_pairs(
+    name: str,
+    cal: MarginMonotonicCalibrator,
+    x: np.ndarray,
+    y: np.ndarray,
+    months: np.ndarray,
+) -> Dict[str, object]:
+    prob = cal.predict_scores(x, months)
+    slope, ece, brier = reliability_from_arrays(prob, y)
+    return {
+        "candidate": name,
+        "calibration_split": cal.calibration_split,
+        "n_samples": int(np.asarray(y).size),
+        "event_rate": float(np.mean(y)) if np.asarray(y).size else float("nan"),
+        "inner_selection_slope": slope,
+        "inner_selection_ece": ece,
+        "inner_selection_brier": brier,
+    }
+
+
+def fit_inner_selected_monotonic_calibrator(
+    x: np.ndarray,
+    y: np.ndarray,
+    months: np.ndarray,
+    pair_years: np.ndarray,
+    calibration_split: str,
+    requested_calibrator: str,
+    min_month_samples: int,
+    min_month_positives: int,
+) -> Tuple[MarginMonotonicCalibrator, Dict[str, MarginMonotonicCalibrator], List[Dict[str, object]], str]:
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    y = np.asarray(y, dtype=np.float32).reshape(-1)
+    months = np.asarray(months, dtype=np.int16).reshape(-1)
+    pair_years = np.asarray(pair_years, dtype=np.int16).reshape(-1)
+
+    full_candidates: Dict[str, MarginMonotonicCalibrator] = {}
+    for method in ("platt", "isotonic"):
+        try:
+            full_candidates[method] = fit_margin_monotonic_calibrator(
+                x,
+                y,
+                months,
+                method=method,
+                calibration_split=calibration_split,
+                # Use pooled monotonic maps for the selected forecast so global ROC-AUC
+                # remains invariant under calibration.
+                min_month_samples=10**12,
+                min_month_positives=10**12,
+            )
+        except Exception as exc:
+            print(f"  full {method} calibrator failed to fit: {exc}")
+
+    if requested_calibrator != "auto":
+        if requested_calibrator not in full_candidates:
+            raise RuntimeError(f"Requested calibrator {requested_calibrator!r} could not be fit.")
+        return (
+            full_candidates[requested_calibrator],
+            full_candidates,
+            [],
+            f"requested {requested_calibrator}",
+        )
+
+    unique_years = np.array(sorted(set(int(v) for v in pair_years)), dtype=np.int16)
+    if unique_years.size < 3:
+        if "platt" not in full_candidates:
+            raise RuntimeError("Too few calibration years for inner selection and Platt could not be fit.")
+        return full_candidates["platt"], full_candidates, [], "defaulted to Platt: fewer than 3 calibration years"
+
+    n_select = max(1, int(math.ceil(0.25 * float(unique_years.size))))
+    select_years = set(int(v) for v in unique_years[-n_select:])
+    fit_mask = np.array([int(v) not in select_years for v in pair_years], dtype=bool)
+    select_mask = ~fit_mask
+    if (
+        int(np.sum(fit_mask)) < 100
+        or int(np.sum(select_mask)) < 100
+        or np.unique(y[fit_mask]).size < 2
+        or np.unique(y[select_mask]).size < 2
+    ):
+        if "platt" not in full_candidates:
+            raise RuntimeError("Inner calibration split too thin and Platt could not be fit.")
+        return full_candidates["platt"], full_candidates, [], "defaulted to Platt: inner split too thin"
+
+    inner_rows: List[Dict[str, object]] = []
+    for method in ("platt", "isotonic"):
+        try:
+            inner_cal = fit_margin_monotonic_calibrator(
+                x[fit_mask],
+                y[fit_mask],
+                months[fit_mask],
+                method=method,
+                calibration_split=f"{calibration_split}_inner_fit",
+                min_month_samples=10**12,
+                min_month_positives=10**12,
+            )
+            row = score_calibrator_on_pairs(
+                method,
+                inner_cal,
+                x[select_mask],
+                y[select_mask],
+                months[select_mask],
+            )
+            row["inner_fit_years"] = " ".join(str(int(v)) for v in unique_years if int(v) not in select_years)
+            row["inner_selection_years"] = " ".join(str(v) for v in sorted(select_years))
+            inner_rows.append(row)
+        except Exception as exc:
+            print(f"  inner {method} calibrator failed to fit/score: {exc}")
+
+    row_by_name = {str(row["candidate"]): row for row in inner_rows}
+    if "platt" not in full_candidates:
+        raise RuntimeError("Platt calibrator could not be fit; refusing to auto-select isotonic.")
+    selected = "platt"
+    reason = "Platt default: isotonic did not beat Platt inner-selection ECE by at least 0.005"
+    if "isotonic" in full_candidates and "platt" in row_by_name and "isotonic" in row_by_name:
+        platt_ece = float(row_by_name["platt"]["inner_selection_ece"])
+        iso_ece = float(row_by_name["isotonic"]["inner_selection_ece"])
+        if np.isfinite(platt_ece) and np.isfinite(iso_ece) and iso_ece <= platt_ece - 0.005:
+            selected = "isotonic"
+            reason = (
+                "Isotonic selected: inner-selection ECE improved by "
+                f"{platt_ece - iso_ece:.4f} >= 0.005"
+            )
+    return full_candidates[selected], full_candidates, inner_rows, reason
+
+
 @dataclass
 class MetricAccumulator:
     name: str
-    hist_bins: int = 101
+    hist_bins: int = 10001
 
     def __post_init__(self):
         self.brier_sum = 0.0
@@ -825,9 +955,13 @@ class MetricAccumulator:
         self.rel = ReliabilityStats()
         self.hist_pos = np.zeros(self.hist_bins, dtype=np.float64)
         self.hist_neg = np.zeros(self.hist_bins, dtype=np.float64)
+        self.auc_hist_pos = np.zeros(self.hist_bins, dtype=np.float64)
+        self.auc_hist_neg = np.zeros(self.hist_bins, dtype=np.float64)
 
-    def update(self, prob: np.ndarray, truth: np.ndarray, mask: np.ndarray) -> None:
+    def update(self, prob: np.ndarray, truth: np.ndarray, mask: np.ndarray, auc_score: Optional[np.ndarray] = None) -> None:
         valid = mask & np.isfinite(prob) & np.isfinite(truth)
+        if auc_score is not None:
+            valid = valid & np.isfinite(auc_score)
         if not np.any(valid):
             return
         p = np.clip(prob[valid].astype(np.float64), 0.0, 1.0)
@@ -839,17 +973,21 @@ class MetricAccumulator:
         idx = np.minimum((p * (self.hist_bins - 1)).round().astype(np.int64), self.hist_bins - 1)
         self.hist_pos += np.bincount(idx, weights=y, minlength=self.hist_bins)
         self.hist_neg += np.bincount(idx, weights=1.0 - y, minlength=self.hist_bins)
+        auc_values = p if auc_score is None else np.clip(auc_score[valid].astype(np.float64), 0.0, 1.0)
+        auc_idx = np.minimum((auc_values * (self.hist_bins - 1)).round().astype(np.int64), self.hist_bins - 1)
+        self.auc_hist_pos += np.bincount(auc_idx, weights=y, minlength=self.hist_bins)
+        self.auc_hist_neg += np.bincount(auc_idx, weights=1.0 - y, minlength=self.hist_bins)
 
     def brier(self) -> float:
         return self.brier_sum / self.count if self.count > 0 else float("nan")
 
     def aucs(self) -> Tuple[float, float]:
-        pos_total = float(self.hist_pos.sum())
-        neg_total = float(self.hist_neg.sum())
+        pos_total = float(self.auc_hist_pos.sum())
+        neg_total = float(self.auc_hist_neg.sum())
         if pos_total <= 0 or neg_total <= 0:
             return float("nan"), float("nan")
-        tp = np.cumsum(self.hist_pos[::-1])
-        fp = np.cumsum(self.hist_neg[::-1])
+        tp = np.cumsum(self.auc_hist_pos[::-1])
+        fp = np.cumsum(self.auc_hist_neg[::-1])
         tpr = np.r_[0.0, tp / pos_total, 1.0]
         fpr = np.r_[0.0, fp / neg_total, 1.0]
         roc_auc = float(np.trapz(tpr, fpr))
@@ -885,9 +1023,17 @@ class EvaluationAccumulator:
         }
         self.region_masks = region_masks_map
 
-    def update(self, name: str, prob: np.ndarray, truth: np.ndarray, mask: np.ndarray, month: int) -> None:
-        self.metrics[name].update(prob, truth, mask)
-        self.monthly[int(month)][name].update(prob, truth, mask)
+    def update(
+        self,
+        name: str,
+        prob: np.ndarray,
+        truth: np.ndarray,
+        mask: np.ndarray,
+        month: int,
+        auc_score: Optional[np.ndarray] = None,
+    ) -> None:
+        self.metrics[name].update(prob, truth, mask, auc_score=auc_score)
+        self.monthly[int(month)][name].update(prob, truth, mask, auc_score=auc_score)
         for region, rmask in self.region_masks.items():
             valid = mask & rmask & np.isfinite(prob) & np.isfinite(truth)
             if not np.any(valid):
@@ -906,6 +1052,7 @@ class EvaluationAccumulator:
             brier = acc.brier()
             row = {
                 "model": name,
+                "valid_count": acc.count,
                 "brier": brier,
                 "bss_vs_monthly_climo": 1.0 - brier / ref if np.isfinite(ref) and ref > 0 else float("nan"),
                 "base_rate": acc.truth_pos / acc.count if acc.count > 0 else float("nan"),
@@ -1289,7 +1436,7 @@ def monotonic_calibrator_cache_path(
         cfm.Config.OUTPUT_DIR,
         "data_cache",
         (
-            f"monotonic_calibrator_{target_mode}_{suffix}_{pred}_"
+            f"monotonic_calibrator_v2_{target_mode}_{suffix}_{pred}_"
             f"{cfm.cv_split_tag(cfm.Config)}_fold{fold}_cal{calibration_split}_"
             f"{requested_calibrator}_ckpt{ckpt_tag}.pkl"
         ),
@@ -1404,7 +1551,7 @@ def load_or_fit_monotonic_calibrator(
     min_month_positives: int,
     seed: int,
     progress_every: int,
-) -> Tuple[MarginMonotonicCalibrator, Dict[str, MarginMonotonicCalibrator]]:
+) -> Tuple[MarginMonotonicCalibrator, Dict[str, MarginMonotonicCalibrator], List[Dict[str, object]], str]:
     path = monotonic_calibrator_cache_path(
         target_mode, window_leads, calibration_split, requested_calibrator, checkpoint_path
     )
@@ -1426,9 +1573,15 @@ def load_or_fit_monotonic_calibrator(
                 and tuple(payload.get("window_leads", ())) == tuple(int(x) for x in window_leads)
                 and payload.get("target_mode") == target_mode
                 and payload.get("requested_calibrator") == requested_calibrator
+                and payload.get("selector_version") == 2
             ):
                 print(f"Loading held-out monotonic calibrator from {path}")
-                return payload["chosen"], payload["candidates"]
+                return (
+                    payload["chosen"],
+                    payload["candidates"],
+                    payload.get("inner_selection_rows", []),
+                    payload.get("selection_reason", "cached selection"),
+                )
         except Exception:
             pass
 
@@ -1455,31 +1608,33 @@ def load_or_fit_monotonic_calibrator(
     if set(int(y0) for y0 in np.unique(pair_years)) & eval_year_set:
         raise RuntimeError("Eval year appeared in calibration pairs.")
 
-    candidates: Dict[str, MarginMonotonicCalibrator] = {}
-    for method in ("platt", "isotonic"):
-        try:
-            candidates[method] = fit_margin_monotonic_calibrator(
-                x,
-                y,
-                month_arr,
-                method=method,
-                calibration_split=calibration_split,
-                min_month_samples=int(min_month_samples),
-                min_month_positives=int(min_month_positives),
-            )
-        except Exception as exc:
-            print(f"  {method} calibrator failed to fit: {exc}")
-
-    chosen = choose_monotonic_calibrator(candidates, requested_calibrator)
+    chosen, candidates, inner_selection_rows, selection_reason = fit_inner_selected_monotonic_calibrator(
+        x,
+        y,
+        month_arr,
+        pair_years,
+        calibration_split,
+        requested_calibrator,
+        min_month_samples=int(min_month_samples),
+        min_month_positives=int(min_month_positives),
+    )
     print("Held-out monotonic calibration candidates")
     print("----------------------------------------")
     for name, cal in candidates.items():
         print(
-            f"{name:8s} calibration ECE={cal.calibration_ece:.4f}, "
+            f"{name:8s} full-cal ECE={cal.calibration_ece:.4f}, "
             f"slope={cal.calibration_slope:.3f}, Brier={cal.calibration_brier:.5f}, "
             f"month_models={len(cal.by_month)}"
         )
-    print(f"Chosen calibrator: {chosen.method}")
+    if inner_selection_rows:
+        print("Inner-selection calibration scores")
+        for row in inner_selection_rows:
+            print(
+                f"{row['candidate']:8s} inner ECE={float(row['inner_selection_ece']):.4f}, "
+                f"slope={float(row['inner_selection_slope']):.3f}, "
+                f"Brier={float(row['inner_selection_brier']):.5f}"
+            )
+    print(f"Chosen calibrator: {chosen.method} ({selection_reason})")
 
     with open(path, "wb") as f:
         pickle.dump({
@@ -1491,9 +1646,12 @@ def load_or_fit_monotonic_calibrator(
             "target_mode": target_mode,
             "requested_calibrator": requested_calibrator,
             "checkpoint_path": os.path.abspath(checkpoint_path),
+            "selector_version": 2,
+            "inner_selection_rows": inner_selection_rows,
+            "selection_reason": selection_reason,
         }, f)
     print(f"  Saved held-out monotonic calibrator to {path}")
-    return chosen, candidates
+    return chosen, candidates, inner_selection_rows, selection_reason
 
 
 def train_model_output_calibrator(
@@ -1814,7 +1972,7 @@ def evaluate(args: argparse.Namespace) -> None:
         calibration_split, cfm.Config, shared_data, norm_stats, climo,
         train_indices, val_indices, test_indices,
     )
-    monotonic_calibrator, monotonic_candidates = load_or_fit_monotonic_calibrator(
+    monotonic_calibrator, monotonic_candidates, inner_selection_rows, selection_reason = load_or_fit_monotonic_calibrator(
         model,
         calibration_dataset,
         calibration_split,
@@ -1924,6 +2082,8 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"Evaluating split={eval_split}, samples={len(dataset)}")
     leakage_ok = True
     causal_ok = True
+    analytic_valid_total = 0
+    calibrated_valid_total = 0
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(loader):
@@ -1983,6 +2143,19 @@ def evaluate(args: argparse.Namespace) -> None:
             stage1[~mask_np] = np.nan
             old_train_calibrated = old_train_calibrator.predict_grid(mu_z, q, sigma, target_month, mask_np)
             calibrated = monotonic_calibrator.predict_grid(mu_z, q, sigma, target_month, mask_np)
+            stage1_valid = mask_np & np.isfinite(stage1) & np.isfinite(truth)
+            calibrated_valid = mask_np & np.isfinite(calibrated) & np.isfinite(truth)
+            if not np.array_equal(stage1_valid, calibrated_valid):
+                missing = int(np.sum(stage1_valid & ~calibrated_valid))
+                extra = int(np.sum(calibrated_valid & ~stage1_valid))
+                raise RuntimeError(
+                    "Held-out calibrated forecast valid-cell mask differs from analytic forecast "
+                    f"at sample={batch_idx}, target_t={target_t}, month={target_month}: "
+                    f"analytic_count={int(np.sum(stage1_valid))}, calibrated_count={int(np.sum(calibrated_valid))}, "
+                    f"missing={missing}, extra={extra}"
+                )
+            analytic_valid_total += int(np.sum(stage1_valid))
+            calibrated_valid_total += int(np.sum(calibrated_valid))
             monthly_climo = base_rate[target_month]
             thresholded = (mu_z > q).astype(np.float32)
             thresholded[~mask_np] = np.nan
@@ -2002,6 +2175,11 @@ def evaluate(args: argparse.Namespace) -> None:
                 analytic_name: stage1,
                 old_calibrated_name: old_train_calibrated,
                 calibrated_name: calibrated,
+            }
+            auc_scores = {
+                analytic_name: stage1,
+                old_calibrated_name: stage1,
+                calibrated_name: stage1,
             }
             if target_mode == "window":
                 forecasts["persistence_init"] = trailing_windowed_exceedance_probability(
@@ -2023,7 +2201,7 @@ def evaluate(args: argparse.Namespace) -> None:
                     )
 
             for name, prob in forecasts.items():
-                acc.update(name, prob, truth, mask_np, target_month)
+                acc.update(name, prob, truth, mask_np, target_month, auc_score=auc_scores.get(name))
 
             if daily_compare_acc is not None:
                 daily_target_t = t + int(cfm.Config.LEAD_TIME)
@@ -2049,6 +2227,11 @@ def evaluate(args: argparse.Namespace) -> None:
         raise RuntimeError("Leakage assert failed: evaluation target year was in train years.")
     if not causal_ok:
         raise RuntimeError("Causality assert failed for persistence baseline.")
+    if analytic_valid_total != calibrated_valid_total:
+        raise RuntimeError(
+            "Held-out calibrated valid-cell total differs from analytic forecast: "
+            f"analytic={analytic_valid_total}, calibrated={calibrated_valid_total}"
+        )
 
     summary_rows = acc.summary_rows(reference_name)
     monthly_rows = acc.monthly_rows(reference_name)
@@ -2066,6 +2249,7 @@ def evaluate(args: argparse.Namespace) -> None:
             {
                 "candidate": name,
                 "selected": name == monotonic_calibrator.method,
+                "selection_reason": selection_reason if name == monotonic_calibrator.method else "",
                 "calibration_split": cal.calibration_split,
                 "n_samples": cal.n_samples,
                 "event_rate": cal.event_rate,
@@ -2077,6 +2261,7 @@ def evaluate(args: argparse.Namespace) -> None:
             for name, cal in sorted(monotonic_candidates.items())
         ],
     )
+    write_csv(out_dir / "heldout_monotonic_inner_selection.csv", inner_selection_rows)
     for name, rows in rel_tables.items():
         write_csv(out_dir / f"reliability_{name}.csv", rows)
     plot_reliability(out_dir / "reliability_diagram.png", rel_tables)
@@ -2103,7 +2288,7 @@ def evaluate(args: argparse.Namespace) -> None:
     print("=============================")
     for row in summary_rows:
         print(
-            f"{row['model']:28s} Brier={row['brier']:.5f} "
+            f"{row['model']:28s} N={int(row['valid_count'])} Brier={row['brier']:.5f} "
             f"BSS={row['bss_vs_monthly_climo']:+.4f} "
             f"slope={row['reliability_slope']:.3f} ECE={row['ece']:.4f} "
             f"ROC-AUC={row['roc_auc']:.3f} PR-AUC={row['pr_auc']:.3f}"
@@ -2113,6 +2298,10 @@ def evaluate(args: argparse.Namespace) -> None:
     print(
         "Disjointness asserts: PASS "
         f"(train={len(train_year_set)} years, calibration={calibration_split}, eval={eval_split})"
+    )
+    print(
+        "Valid-cell mask assert: PASS "
+        f"(analytic={analytic_valid_total}, heldout_calibrated={calibrated_valid_total})"
     )
     print("Leakage asserts: PASS (train-only thresholds/stats; calibration/eval years held out)")
     print("Causal persistence asserts: PASS (history windows end at init day)")
@@ -2124,6 +2313,15 @@ def evaluate(args: argparse.Namespace) -> None:
             f"  {name}: ECE={cal.calibration_ece:.4f}, "
             f"slope={cal.calibration_slope:.3f}, Brier={cal.calibration_brier:.5f} ({selected})"
         )
+    if inner_selection_rows:
+        print("Inner-selection calibration scores:")
+        for row in inner_selection_rows:
+            print(
+                f"  {row['candidate']}: ECE={float(row['inner_selection_ece']):.4f}, "
+                f"slope={float(row['inner_selection_slope']):.3f}, "
+                f"Brier={float(row['inner_selection_brier']):.5f}"
+            )
+    print(f"Calibrator selection: {monotonic_calibrator.method} ({selection_reason})")
     if target_mode == "window":
         print(
             f"Windowed BSS vs windowed climatology: {stage1['bss_vs_monthly_climo']:+.4f} "
@@ -2166,6 +2364,11 @@ def evaluate(args: argparse.Namespace) -> None:
         f"analytic={stage1['roc_auc']:.4f}, heldout={calibrated_row['roc_auc']:.4f}, "
         f"abs_diff={auc_diff:.4g}"
     )
+    if np.isfinite(auc_diff) and auc_diff > 0.005:
+        raise RuntimeError(
+            "Monotonic AUC assert failed: analytic and held-out calibrated ROC-AUC differ by "
+            f"{auc_diff:.4f} > 0.005."
+        )
     print(
         "PR-AUC is secondary only; selection/headline metric is BSS with reliability diagnostics."
     )
