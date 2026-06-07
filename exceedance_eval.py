@@ -1332,6 +1332,44 @@ class ModelOutputLogisticCalibrator:
         return rows
 
 
+@dataclass
+class ClimatologyAnchoredLogisticCalibrator:
+    feature_names: Tuple[str, ...]
+    coef: np.ndarray
+    calibration_split: str
+    n_samples: int
+    event_rate: float
+    mean_base_rate: float
+
+    def predict_features(self, x: np.ndarray, base_rate: np.ndarray) -> np.ndarray:
+        base = np.clip(np.asarray(base_rate, dtype=np.float32), 1e-5, 1.0 - 1e-5)
+        fixed_offset = np.log(base / (1.0 - base))
+        logits = np.clip(fixed_offset + x.astype(np.float32) @ self.coef, -30.0, 30.0)
+        return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+
+    def coefficient_rows(self) -> List[Dict[str, object]]:
+        rows = [{
+            "feature": "fixed_logit_train_climatology",
+            "coef": 1.0,
+            "feature_mean": self.mean_base_rate,
+            "feature_std": "fixed_offset_no_intercept",
+            "calibration_split": self.calibration_split,
+            "n_samples": self.n_samples,
+            "event_rate": self.event_rate,
+        }]
+        for name, coef in zip(self.feature_names, self.coef):
+            rows.append({
+                "feature": name,
+                "coef": float(coef),
+                "feature_mean": "",
+                "feature_std": "",
+                "calibration_split": self.calibration_split,
+                "n_samples": self.n_samples,
+                "event_rate": self.event_rate,
+            })
+        return rows
+
+
 def calibration_feature_names(region_names: Sequence[str]) -> Tuple[str, ...]:
     return (
         "stage1_logit",
@@ -1416,6 +1454,72 @@ def fit_model_output_logistic_calibrator(
     )
 
 
+def fit_climatology_anchored_logistic_calibrator(
+    features: np.ndarray,
+    labels: np.ndarray,
+    base_rates: np.ndarray,
+    feature_names: Sequence[str],
+    calibration_split: str,
+    steps: int,
+    lr: float,
+    l2: float,
+) -> ClimatologyAnchoredLogisticCalibrator:
+    """Fit slopes only; train-climatology logit remains the fixed offset."""
+    x = np.asarray(features, dtype=np.float64)
+    y = np.asarray(labels, dtype=np.float64)
+    base = np.asarray(base_rates, dtype=np.float64)
+    valid = np.all(np.isfinite(x), axis=1) & np.isfinite(y) & np.isfinite(base)
+    x = x[valid]
+    y = y[valid]
+    base = np.clip(base[valid], 1e-5, 1.0 - 1e-5)
+    if x.shape[0] < 100 or np.unique(y).size < 2:
+        raise RuntimeError("Not enough valid positive/negative samples to fit climatology-anchored logistic model.")
+
+    fixed_offset = np.log(base / (1.0 - base))
+    coef = np.zeros(x.shape[1], dtype=np.float64)
+    for _ in range(int(steps)):
+        logits = np.clip(fixed_offset + x @ coef, -30.0, 30.0)
+        p = 1.0 / (1.0 + np.exp(-logits))
+        gradient = (x.T @ (p - y)) / x.shape[0] + float(l2) * coef
+        weight = np.maximum(p * (1.0 - p), 1e-8)
+        hessian = (x.T @ (x * weight[:, None])) / x.shape[0]
+        hessian += (float(l2) + 1e-8) * np.eye(x.shape[1], dtype=np.float64)
+        try:
+            newton_step = np.linalg.solve(hessian, gradient)
+        except np.linalg.LinAlgError:
+            newton_step = np.linalg.lstsq(hessian, gradient, rcond=None)[0]
+
+        current_objective = float(
+            np.mean(np.logaddexp(0.0, logits) - y * logits)
+            + 0.5 * float(l2) * np.dot(coef, coef)
+        )
+        step_scale = min(1.0, max(float(lr), 1e-3) * 10.0)
+        accepted = False
+        while step_scale >= 1e-4:
+            candidate = coef - step_scale * newton_step
+            candidate_logits = np.clip(fixed_offset + x @ candidate, -30.0, 30.0)
+            candidate_objective = float(
+                np.mean(np.logaddexp(0.0, candidate_logits) - y * candidate_logits)
+                + 0.5 * float(l2) * np.dot(candidate, candidate)
+            )
+            if candidate_objective <= current_objective:
+                coef = candidate
+                accepted = True
+                break
+            step_scale *= 0.5
+        if not accepted or np.linalg.norm(step_scale * newton_step) < 1e-7:
+            break
+
+    return ClimatologyAnchoredLogisticCalibrator(
+        feature_names=tuple(feature_names),
+        coef=coef.astype(np.float32),
+        calibration_split=calibration_split,
+        n_samples=int(y.size),
+        event_rate=float(y.mean()),
+        mean_base_rate=float(base.mean()),
+    )
+
+
 def resolve_calibration_split(requested: str, eval_split: str) -> str:
     if requested != "auto":
         return requested
@@ -1483,6 +1587,7 @@ INCREMENTAL_SKILL_SPECS: Dict[str, Tuple[str, ...]] = {
     "incremental_C_init_plus_forecast": ("init_margin", "forecast_margin"),
     "incremental_D_init_forecast_sigma": ("init_margin", "forecast_margin", "predicted_sigma"),
 }
+CLIMATOLOGY_ANCHORED_MODEL_NAME = "incremental_E_climo_offset_init_forecast"
 
 
 def collect_incremental_skill_pairs(
@@ -1491,6 +1596,7 @@ def collect_incremental_skill_pairs(
     split_name: str,
     split_years: Iterable[int],
     q95_z: np.ndarray,
+    base_rate: np.ndarray,
     months: np.ndarray,
     years: np.ndarray,
     mask_np: np.ndarray,
@@ -1503,7 +1609,7 @@ def collect_incremental_skill_pairs(
     max_samples: int,
     seed: int,
     progress_every: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Collect held-out init/forecast/sigma features without touching eval years."""
     rng = np.random.default_rng(seed)
     split_year_set = set(int(y) for y in split_years)
@@ -1514,6 +1620,7 @@ def collect_incremental_skill_pairs(
     features: List[np.ndarray] = []
     labels: List[np.ndarray] = []
     pair_years: List[np.ndarray] = []
+    pair_base_rates: List[np.ndarray] = []
     include_sigma = bool(cfm.Config.DISTRIBUTIONAL_HEAD)
     print(
         "Collecting incremental-skill pairs: "
@@ -1555,8 +1662,16 @@ def collect_incremental_skill_pairs(
                     f"Incremental-skill pair year leakage for split={split_name}: target_year={target_year}"
                 )
             q = q95_z[month]
+            climo_rate = base_rate[month]
             init_z = batch[1][0, 0, : q.shape[0], : q.shape[1]].numpy().astype(np.float32)
-            valid = mask_np & np.isfinite(init_z) & np.isfinite(mu_z) & np.isfinite(truth_z) & np.isfinite(q)
+            valid = (
+                mask_np
+                & np.isfinite(init_z)
+                & np.isfinite(mu_z)
+                & np.isfinite(truth_z)
+                & np.isfinite(q)
+                & np.isfinite(climo_rate)
+            )
             candidates = np.flatnonzero(valid.ravel())
             if candidates.size == 0:
                 continue
@@ -1568,6 +1683,7 @@ def collect_incremental_skill_pairs(
             ]).astype(np.float32))
             labels.append((truth_z.ravel()[chosen] > q.ravel()[chosen]).astype(np.float32))
             pair_years.append(np.full(chosen.size, target_year, dtype=np.int16))
+            pair_base_rates.append(climo_rate.ravel()[chosen].astype(np.float32))
             if (batch_idx + 1) % max(1, int(progress_every)) == 0:
                 print(f"  incremental-skill pairs processed {batch_idx + 1}/{len(subset_idx)}")
     if not features:
@@ -1575,21 +1691,23 @@ def collect_incremental_skill_pairs(
     x = np.concatenate(features, axis=0)[:max_samples]
     y = np.concatenate(labels, axis=0)[:max_samples]
     py = np.concatenate(pair_years, axis=0)[:max_samples]
+    br = np.concatenate(pair_base_rates, axis=0)[:max_samples]
     if not set(int(v) for v in np.unique(py)).issubset(split_year_set):
         raise RuntimeError("Incremental-skill calibration pairs contain years outside the calibration split.")
-    return x, y, py
+    return x, y, py, br
 
 
 def fit_incremental_skill_models(
     features: np.ndarray,
     labels: np.ndarray,
+    base_rates: np.ndarray,
     calibration_split: str,
     steps: int,
     lr: float,
     l2: float,
-) -> Dict[str, ModelOutputLogisticCalibrator]:
+) -> Dict[str, Any]:
     column_index = {"init_margin": 0, "forecast_margin": 1, "predicted_sigma": 2}
-    models: Dict[str, ModelOutputLogisticCalibrator] = {}
+    models: Dict[str, Any] = {}
     for model_name, feature_names in INCREMENTAL_SKILL_SPECS.items():
         if "predicted_sigma" in feature_names and not np.any(np.isfinite(features[:, 2])):
             print(f"Skipping {model_name}: checkpoint does not provide predicted sigma.")
@@ -1609,22 +1727,62 @@ def fit_incremental_skill_models(
             f"features={feature_names}, n={models[model_name].n_samples}, "
             f"event_rate={models[model_name].event_rate:.4f}"
         )
+    anchored_features = ("init_margin", "forecast_margin")
+    anchored_idx = [column_index[name] for name in anchored_features]
+    models[CLIMATOLOGY_ANCHORED_MODEL_NAME] = fit_climatology_anchored_logistic_calibrator(
+        features[:, anchored_idx],
+        labels,
+        base_rates,
+        anchored_features,
+        calibration_split=calibration_split,
+        steps=steps,
+        lr=lr,
+        l2=l2,
+    )
+    anchored = models[CLIMATOLOGY_ANCHORED_MODEL_NAME]
+    finite_base_rates = np.asarray(base_rates, dtype=np.float32)
+    finite_base_rates = finite_base_rates[np.isfinite(finite_base_rates)][:1024]
+    zero_margin_prob = anchored.predict_features(
+        np.zeros((finite_base_rates.size, len(anchored_features)), dtype=np.float32),
+        finite_base_rates,
+    )
+    anchor_error = float(np.max(np.abs(zero_margin_prob - finite_base_rates)))
+    if anchor_error > 1e-6:
+        raise RuntimeError(
+            "Climatology-anchored model invariant failed: zero-margin probability does not equal "
+            f"the train-only base rate (max_abs_error={anchor_error:.3g})."
+        )
+    print(
+        f"Fitted {CLIMATOLOGY_ANCHORED_MODEL_NAME} on {calibration_split}: "
+        f"fixed_offset=train_month_pixel_climatology, learned_intercept=False, "
+        f"features={anchored_features}, n={anchored.n_samples}, "
+        f"event_rate={anchored.event_rate:.4f}, mean_base_rate={anchored.mean_base_rate:.4f}, "
+        f"zero_margin_anchor_error={anchor_error:.3g}"
+    )
     return models
 
 
 def predict_incremental_skill_grid(
-    calibrator: ModelOutputLogisticCalibrator,
+    calibrator: Any,
     feature_fields: Mapping[str, np.ndarray],
     mask: np.ndarray,
+    base_rate: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     fields = [np.asarray(feature_fields[name], dtype=np.float32) for name in calibrator.feature_names]
     valid = mask.copy()
     for field in fields:
         valid &= np.isfinite(field)
+    if isinstance(calibrator, ClimatologyAnchoredLogisticCalibrator):
+        if base_rate is None:
+            raise RuntimeError("Climatology-anchored incremental model requires a train-only base-rate field.")
+        valid &= np.isfinite(base_rate)
     out = np.full(mask.shape, np.nan, dtype=np.float32)
     if np.any(valid):
         x = np.column_stack([field[valid] for field in fields]).astype(np.float32)
-        out[valid] = calibrator.predict_features(x)
+        if isinstance(calibrator, ClimatologyAnchoredLogisticCalibrator):
+            out[valid] = calibrator.predict_features(x, base_rate[valid])
+        else:
+            out[valid] = calibrator.predict_features(x)
     return out
 
 
@@ -2269,14 +2427,15 @@ def evaluate(args: argparse.Namespace) -> None:
             use_model_sigma=False,
         )
 
-    incremental_models: Dict[str, ModelOutputLogisticCalibrator] = {}
+    incremental_models: Dict[str, Any] = {}
     if args.incremental_skill_diagnostic:
-        incremental_x, incremental_y, incremental_years = collect_incremental_skill_pairs(
+        incremental_x, incremental_y, incremental_years, incremental_base_rates = collect_incremental_skill_pairs(
             model,
             calibration_dataset,
             calibration_split,
             calibration_years,
             q95_z,
+            base_rate,
             months,
             years,
             mask_np,
@@ -2295,6 +2454,7 @@ def evaluate(args: argparse.Namespace) -> None:
         incremental_models = fit_incremental_skill_models(
             incremental_x,
             incremental_y,
+            incremental_base_rates,
             calibration_split=calibration_split,
             steps=int(args.calibration_steps),
             lr=float(args.calibration_lr),
@@ -2520,7 +2680,12 @@ def evaluate(args: argparse.Namespace) -> None:
                     ),
                 }
                 incremental_probs = {
-                    name: predict_incremental_skill_grid(calibrator, incremental_feature_fields, mask_np)
+                    name: predict_incremental_skill_grid(
+                        calibrator,
+                        incremental_feature_fields,
+                        mask_np,
+                        base_rate=base_rate[target_month],
+                    )
                     for name, calibrator in incremental_models.items()
                 }
 
@@ -2726,9 +2891,18 @@ def evaluate(args: argparse.Namespace) -> None:
             for row in summary_rows
             if row["model"] in incremental_models
         }
+        anchored_row = incremental_rows[CLIMATOLOGY_ANCHORED_MODEL_NAME]
+        reference_valid_count = next(
+            row["valid_count"] for row in summary_rows if row["model"] == reference_name
+        )
+        if anchored_row["valid_count"] != reference_valid_count:
+            raise RuntimeError(
+                "Climatology-anchored incremental model valid-cell count differs from reference: "
+                f"anchored={anchored_row['valid_count']}, reference={reference_valid_count}"
+            )
         init_bss = incremental_rows["incremental_A_init_margin"]["bss_vs_monthly_climo"]
         print("Incremental-skill diagnostic (fit on calibration split, scored on eval split):")
-        for name in INCREMENTAL_SKILL_SPECS:
+        for name in (*INCREMENTAL_SKILL_SPECS, CLIMATOLOGY_ANCHORED_MODEL_NAME):
             if name not in incremental_rows:
                 continue
             row = incremental_rows[name]
@@ -2742,6 +2916,7 @@ def evaluate(args: argparse.Namespace) -> None:
                 "incremental_B_forecast_margin",
                 "incremental_C_init_plus_forecast",
                 "incremental_D_init_forecast_sigma",
+                CLIMATOLOGY_ANCHORED_MODEL_NAME,
             )
             if name in incremental_rows
         ]
@@ -2760,6 +2935,17 @@ def evaluate(args: argparse.Namespace) -> None:
         print(
             "Incremental-skill leakage assert: PASS "
             f"(fit={calibration_split}, eval={eval_split}, disjoint years)"
+        )
+        print(
+            "Climatology-anchor asserts: PASS "
+            f"(fixed train-only pixel/month offset, no learned intercept, "
+            f"valid_cells={int(anchored_row['valid_count'])})"
+        )
+        print(
+            "Climatology-anchor comparison: "
+            f"delta_BSS_vs_A={anchored_row['bss_vs_monthly_climo'] - init_bss:+.4f}, "
+            f"delta_BSS_vs_C="
+            f"{anchored_row['bss_vs_monthly_climo'] - incremental_rows['incremental_C_init_plus_forecast']['bss_vs_monthly_climo']:+.4f}"
         )
     if target_mode == "window":
         print(
@@ -2839,7 +3025,7 @@ def main() -> None:
     parser.add_argument("--target_mode", choices=["daily", "window"], default="daily")
     parser.add_argument("--window_leads", default=None, help="Comma-separated lead offsets for --target_mode window; defaults to predicted tube leads.")
     parser.add_argument("--use_model_sigma", action="store_true", help="Use distributional model sigma in Phi((mu-q95)/sigma) instead of cached sigma.")
-    parser.add_argument("--incremental_skill_diagnostic", action="store_true", help="Fit A-D init/forecast/sigma logistic diagnostics on calibration years and score on eval years.")
+    parser.add_argument("--incremental_skill_diagnostic", action="store_true", help="Fit A-E incremental diagnostics, including a train-climatology-anchored model, on calibration years and score on eval years.")
     parser.add_argument("--persistence_windows", default="7,14,30")
     parser.add_argument("--max_logistic_samples", type=int, default=1000000)
     parser.add_argument("--calibration_split", choices=["auto", "train", "val", "test"], default="val")
