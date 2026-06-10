@@ -423,6 +423,40 @@ def max_prediction_lead(config=Config):
     return max(prediction_leads(config))
 
 
+def tube_mean_display_label(config=Config):
+    """Human-readable tube-mean label; metric keys remain backward compatible."""
+    return f"{len(prediction_leads(config))}-day mean"
+
+
+def validate_prediction_lead_config(config=Config, max_supported_lead=28):
+    """Fail early when a requested tube cannot be indexed or shaped safely."""
+    leads = prediction_leads(config)
+    if any(int(lead) <= 0 for lead in leads):
+        raise ValueError(f"Prediction leads must be positive, got {leads}.")
+    if tuple(sorted(set(leads))) != leads:
+        raise ValueError(f"Prediction leads must be unique and strictly increasing, got {leads}.")
+    if max(leads) > int(max_supported_lead):
+        raise ValueError(
+            f"Maximum prediction lead {max(leads)} exceeds the validated campaign ceiling "
+            f"of {int(max_supported_lead)} days."
+        )
+    if getattr(config, "MULTI_LEAD_TUBE", False):
+        center_lead_index(config)
+        if len(leads) < 2:
+            raise RuntimeError("--multi_lead_tube needs at least two prediction leads.")
+    lowpass_history = (
+        int(config.GLOBAL_LOWPASS_WINDOW_DAYS) - 1
+        if config.GLOBAL_DECOMPOSE_LOW_RESIDUAL else 0
+    )
+    history = required_input_history(config)
+    if history < lowpass_history:
+        raise RuntimeError(
+            f"Required input history {history} does not cover the global low-pass history "
+            f"of {lowpass_history} days."
+        )
+    return leads, history
+
+
 def parse_int_tuple(text):
     values = tuple(int(x.strip()) for x in str(text).split(",") if x.strip())
     if not values:
@@ -588,7 +622,7 @@ def print_config_banner():
     if Config.MULTI_LEAD_TUBE:
         print(
             f"Prediction tube: leads {prediction_leads(Config)} days "
-            f"(center t+{Config.LEAD_TIME}); same-init weekly7 enabled"
+            f"(center t+{Config.LEAD_TIME}); same-init {tube_mean_display_label(Config)} enabled"
         )
     else:
         print(f"Lead time: {Config.LEAD_TIME} days DIRECT (no rollout)")
@@ -651,7 +685,8 @@ def print_config_banner():
             "Tube training loss: "
             f"{Config.TUBE_LOSS_DAILY_WEIGHT:.2f}*mean_daily_{loss_name} + "
             f"{Config.TUBE_LOSS_CENTER_WEIGHT:.2f}*center_t+{Config.LEAD_TIME}_{loss_name} + "
-            f"{Config.TUBE_LOSS_WEEKLY_WEIGHT:.2f}*same_init_weekly7_{loss_name}"
+            f"{Config.TUBE_LOSS_WEEKLY_WEIGHT:.2f}*"
+            f"same_init_{tube_mean_display_label(Config).replace(' ', '_')}_{loss_name}"
         )
     if Config.DISTRIBUTIONAL_HEAD:
         print(
@@ -2584,7 +2619,8 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         print(f"  Temporal anomaly correlation (TAC): model={tac:.4f}, "
               f"persistence={persistence_tac:.4f}")
         print(
-            f"  {'Tube same-init' if tube_mode else 'True'} 7-day mean TAC: model={weekly7_tac:.4f}, "
+            f"  {'Tube same-init ' + tube_mean_display_label(Config) if tube_mode else 'True 7-day mean'} "
+            f"TAC: model={weekly7_tac:.4f}, "
             f"persistence={weekly7_persistence_tac:.4f}, n={weekly7_samples}"
         )
         if tube_mode and per_lead_tac:
@@ -2769,6 +2805,11 @@ def _weekly7_stats_from_daily_records(records, time_values, climo_by_doy, mask_n
     correlation is accumulated. This is the operational-style weekly metric,
     unlike the old diagnostic that averaged truth only.
     """
+    if Config.MULTI_LEAD_TUBE:
+        raise RuntimeError(
+            "_weekly7_stats_from_daily_records is a neighboring-init daily-mode diagnostic "
+            "and must not be called in multi-lead tube mode."
+        )
     h, w = mask_np.shape
     stats = _empty_tac_stats(h, w)
     monthly_stats = {}
@@ -3353,7 +3394,9 @@ def export_hindcast_tac_stats(model, dataset, split_name, output_path, device, m
         f"  Saved hindcast TAC stats for {split_name} to {output_path}\n"
         f"  {split_name}: n={total}, years={years}, TAC={model_tac:.4f}, "
         f"persistence_TAC={persistence_tac:.4f}\n"
-        f"  {split_name} {'tube same-init weekly7' if tube_mode else 'true weekly7'}: n={weekly7_samples}, "
+        f"  {split_name} "
+        f"{'tube same-init ' + tube_mean_display_label(Config) if tube_mode else 'true weekly7'}: "
+        f"n={weekly7_samples}, "
         f"TAC={weekly7_model_tac:.4f}, persistence_TAC={weekly7_persistence_tac:.4f}, "
         f"MSE={weekly7_model_mse:.4f}, persistence_MSE={weekly7_persistence_mse:.4f}"
     )
@@ -3779,6 +3822,11 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
         print(f"Detected {len(runs)} continuous runs (expected ~43 MJJAS seasons)")
 
     active_max_lead = max_prediction_lead(Config)
+    if active_max_lead != max(prediction_leads(Config)):
+        raise RuntimeError(
+            f"Valid-index max lead {active_max_lead} does not match prediction leads "
+            f"{prediction_leads(Config)}."
+        )
     # Build valid indices: train/val/test must keep every requested target lead inside a continuous season.
     all_valid = build_valid_indices(
         runs,
@@ -4309,12 +4357,15 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                 print(f"  Pers Spatial R2:   {improved_metrics['persistence_spatial_anom_r2']:.4f}")
                 print(f"  TAC:               {improved_metrics['tac']:.4f}")
                 print(f"  Persistence TAC:   {improved_metrics['persistence_tac']:.4f}")
-                print(f"  Weekly7 TAC:       {improved_metrics['weekly7_tac']:.4f}")
-                print(f"  Weekly7 Pers TAC:  {improved_metrics['weekly7_persistence_tac']:.4f}")
-                print(f"  Weekly7 samples:   {int(improved_metrics['weekly7_n_samples'])}")
                 if Config.MULTI_LEAD_TUBE:
-                    print(f"  Tube W7 TAC:       {improved_metrics['tube_weekly7_tac']:.4f}")
-                    print(f"  Tube W7 Pers TAC:  {improved_metrics['tube_weekly7_persistence_tac']:.4f}")
+                    tube_days = len(prediction_leads(Config))
+                    print(f"  Tube W{tube_days} TAC:       {improved_metrics['tube_weekly7_tac']:.4f}")
+                    print(f"  Tube W{tube_days} Pers TAC:  {improved_metrics['tube_weekly7_persistence_tac']:.4f}")
+                    print(f"  Tube W{tube_days} samples:   {int(improved_metrics['tube_weekly7_n_samples'])}")
+                else:
+                    print(f"  Weekly7 TAC:       {improved_metrics['weekly7_tac']:.4f}")
+                    print(f"  Weekly7 Pers TAC:  {improved_metrics['weekly7_persistence_tac']:.4f}")
+                    print(f"  Weekly7 samples:   {int(improved_metrics['weekly7_n_samples'])}")
                 if Config.ENABLE_EXCEEDANCE_HEAD:
                     print(f"  Exceedance BSS:    {improved_metrics['exceedance_bss']:+.4f}")
                     print(f"  Exceedance Brier:  {improved_metrics['exceedance_brier']:.5f}")
@@ -4725,11 +4776,8 @@ def main():
         Config.USE_EXTREME_LOSS = True
         Config.EXTREME_LOSS_WEIGHT = args.extreme_weight
     if Config.MULTI_LEAD_TUBE:
-        center_lead_index(Config)
         if not Config.DETERMINISTIC:
             raise RuntimeError("--multi_lead_tube is currently deterministic-only.")
-        if len(prediction_leads(Config)) < 2:
-            raise RuntimeError("--multi_lead_tube needs at least two prediction leads.")
         weight_sum = (
             float(Config.TUBE_LOSS_DAILY_WEIGHT)
             + float(Config.TUBE_LOSS_CENTER_WEIGHT)
@@ -4737,6 +4785,14 @@ def main():
         )
         if weight_sum <= 0.0:
             raise RuntimeError("Tube loss weights must sum to a positive value.")
+    active_leads, active_history = validate_prediction_lead_config(Config)
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        print(
+            "Prediction lead preflight: PASS "
+            f"(leads={active_leads}, max_lead={max(active_leads)}, "
+            f"required_input_history={active_history}, "
+            f"global_lowpass={Config.GLOBAL_LOWPASS_WINDOW_DAYS} days)"
+        )
     if Config.ENABLE_EXCEEDANCE_HEAD:
         if not Config.DETERMINISTIC:
             raise RuntimeError("--enable_exceedance_head is deterministic-only for Stage 2.")

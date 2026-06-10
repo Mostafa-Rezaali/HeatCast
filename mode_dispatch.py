@@ -52,6 +52,20 @@ def _tube_center_index(model):
     return leads.index(center)
 
 
+def _assert_tube_lead_shape(model, pred, target):
+    expected = len(tuple(int(x) for x in getattr(_raw_model(model), "prediction_leads", (15,))))
+    if pred.ndim < 2 or int(pred.shape[1]) != expected:
+        raise RuntimeError(
+            f"Tube prediction lead dimension mismatch: got shape={tuple(pred.shape)}, "
+            f"expected L={expected}."
+        )
+    if target.ndim < 2 or int(target.shape[1]) != expected:
+        raise RuntimeError(
+            f"Tube target lead dimension mismatch: got shape={tuple(target.shape)}, "
+            f"expected L={expected}."
+        )
+
+
 def _tube_loss_weights(model):
     raw = _raw_model(model)
     return tuple(float(x) for x in getattr(raw, "tube_loss_weights", (0.80, 0.10, 0.10)))
@@ -350,6 +364,7 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
     if _multi_lead_tube(model):
         if y.ndim != 4:
             raise RuntimeError(f"Tube target must have shape (B,L,H,W), got {tuple(y.shape)}")
+        _assert_tube_lead_shape(model, pred, y)
         mask_expanded = mask.expand_as(pred)
         valid = mask_expanded > 0.5
         if valid.any():
