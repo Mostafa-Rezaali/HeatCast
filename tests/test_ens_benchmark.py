@@ -123,6 +123,8 @@ def test_s2s_retrieve_uses_current_ecds_dataset(tmp_path: Path):
     )
     dataset, request, target = calls[0]
     assert dataset == "s2s-reforecasts"
-    assert request["number"] == "1/2/3/4/5/6/7/8/9/10"
+    assert request["number"] == [str(number) for number in range(1, 11)]
+    assert request["hdate"] == ["2021-05-02"]
+    assert request["step"] == ["6", "12", "18", "24"]
     assert "dataset" not in request and "target" not in request
     assert target.endswith("out.grib")

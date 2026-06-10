@@ -52,15 +52,15 @@ def retrieve(
         "time": "00:00:00",
         "levtype": "sfc",
         "param": "121",
-        "step": "/".join(str(step) for step in range(6, int(max_step_hours) + 1, 6)),
+        "step": [str(step) for step in range(6, int(max_step_hours) + 1, 6)],
         "date": model_date.strftime("%Y-%m-%d"),
-        "hdate": "/".join(value.strftime("%Y-%m-%d") for value in hdates),
+        "hdate": [value.strftime("%Y-%m-%d") for value in hdates],
         "grid": "1.5/1.5",
         "area": str(area),
         "type": str(kind),
     }
     if kind == "pf":
-        request["number"] = "1/2/3/4/5/6/7/8/9/10"
+        request["number"] = [str(number) for number in range(1, 11)]
     client.retrieve("s2s-reforecasts", request, str(target))
 
 
