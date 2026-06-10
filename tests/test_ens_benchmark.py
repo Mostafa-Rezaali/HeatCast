@@ -1,0 +1,91 @@
+from pathlib import Path
+
+import numpy as np
+
+from ens_common import (
+    apply_quantile_mapping,
+    common_init_indices,
+    fit_quantile_mapping,
+    intersection_years,
+    member_fraction_probability,
+)
+from stitch_exceedance_folds import load_fold_inputs
+
+
+def test_quantile_mapping_is_monotonic_and_reproduces_train_distribution():
+    rng = np.random.default_rng(42)
+    source = rng.normal(size=(6, 4, 20, 30)).astype(np.float32).reshape(24, 600)
+    target = (1.5 * source + 0.75).astype(np.float32)
+    levels = np.linspace(0.0, 1.0, 51)
+    source_q, target_q = fit_quantile_mapping(source, target, levels)
+    mapped = apply_quantile_mapping(source, source_q, target_q)
+    assert np.all(np.diff(target_q, axis=0) >= -1e-6)
+    assert np.mean(np.abs(np.mean(mapped, axis=0) - np.mean(target, axis=0))) < 0.1
+
+
+def test_member_fraction_probability_uses_all_valid_members():
+    members = np.array([
+        [0.0, 4.0, np.nan],
+        [2.0, 5.0, 3.0],
+        [4.0, 6.0, 5.0],
+        [6.0, 7.0, 7.0],
+    ], dtype=np.float32)
+    probability = member_fraction_probability(members, np.array([3.0, 5.5, 4.0], dtype=np.float32))
+    assert np.allclose(probability, np.array([0.5, 0.5, 2.0 / 3.0], dtype=np.float32))
+
+
+def test_chunk_schema_round_trip_through_stitch_loader(tmp_path: Path):
+    root = tmp_path / "cvfold0_ens_synthetic" / "test" / "window_12-13-14-15-16-17-18"
+    array_dir = root / "incremental_arrays"
+    chunk_dir = array_dir / "test_chunks"
+    chunk_dir.mkdir(parents=True)
+    np.savez_compressed(
+        array_dir / "manifest.npz",
+        run_name=np.array("cvfold0_ens_synthetic"),
+        source_fold=np.array(0, dtype=np.int16),
+        target_mode=np.array("window"),
+        window_leads=np.arange(12, 19, dtype=np.int16),
+        train_years=np.array([2000], dtype=np.int16),
+        calibration_years=np.array([2001], dtype=np.int16),
+        test_years=np.array([2002], dtype=np.int16),
+        calibration_split=np.array("val"),
+        eval_split=np.array("test"),
+        sample_count=np.array(1, dtype=np.int32),
+        valid_cell_count=np.array(600, dtype=np.int64),
+    )
+    np.savez_compressed(
+        array_dir / "calibration_pairs.npz",
+        init_margin=np.linspace(0.0, 1.0, 600, dtype=np.float32),
+        forecast_margin=np.linspace(-2.0, 2.0, 600, dtype=np.float32),
+        model_sigma=np.ones(600, dtype=np.float32),
+        truth=np.tile(np.array([0, 1], dtype=np.uint8), 300),
+        base_rate=np.full(600, 0.05, dtype=np.float32),
+        year=np.full(600, 2001, dtype=np.int16),
+        source_fold=np.array(0, dtype=np.int16),
+    )
+    np.savez_compressed(
+        chunk_dir / "sample_00000.npz",
+        init_margin=np.linspace(0.0, 1.0, 600, dtype=np.float32),
+        forecast_margin=np.linspace(-2.0, 2.0, 600, dtype=np.float32),
+        model_sigma=np.ones(600, dtype=np.float32),
+        truth=np.tile(np.array([0, 1], dtype=np.uint8), 300),
+        base_rate=np.full(600, 0.05, dtype=np.float32),
+        year=np.array(2002, dtype=np.int16),
+        month=np.array(7, dtype=np.int8),
+        source_fold=np.array(0, dtype=np.int16),
+        init_time_index=np.array(123, dtype=np.int32),
+        target_center_time_index=np.array(138, dtype=np.int32),
+    )
+    manifest, calibration, chunks = load_fold_inputs(
+        tmp_path,
+        "cvfold0_ens_synthetic",
+        tuple(range(12, 19)),
+    )
+    assert manifest["sample_count"] == 1
+    assert calibration["truth"].size == 600
+    assert chunks == [chunk_dir / "sample_00000.npz"]
+
+
+def test_intersection_logic_restricts_years_and_init_dates():
+    assert intersection_years([1981, 1982, 1983], [1982, 1983, 1984]) == (1982, 1983)
+    assert common_init_indices({3: "a", 7: "b", 9: "c"}, {2: "d", 7: "e", 9: "f"}) == (7, 9)

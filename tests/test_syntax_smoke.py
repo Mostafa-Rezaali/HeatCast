@@ -15,6 +15,10 @@ CORE_SCRIPTS = (
     "bootstrap_significance.py",
     "exceedance_eval.py",
     "forecasts_of_opportunity.py",
+    "ens_common.py",
+    "ens_ingest.py",
+    "ens_score.py",
+    "ens_compare.py",
 )
 
 
