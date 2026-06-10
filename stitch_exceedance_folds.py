@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pool saved fold-safe exceedance arrays and score A-F across all held-out years."""
+"""Stitch saved fold-safe exceedance arrays and score A-F across all held-out years."""
 
 from __future__ import annotations
 
@@ -163,6 +163,89 @@ def concatenate_calibration(calibrations: Sequence[Mapping[str, np.ndarray]]) ->
     return {key: np.concatenate([np.asarray(item[key]) for item in calibrations], axis=0) for key in keys}
 
 
+def fit_models_from_calibration(
+    calibration: Mapping[str, np.ndarray],
+    calibration_split: str,
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], List[Dict[str, object]]]:
+    features = np.column_stack([
+        calibration["init_margin"],
+        calibration["forecast_margin"],
+        calibration["model_sigma"],
+    ]).astype(np.float32)
+    models, nested_selection_rows = ee.fit_incremental_skill_models(
+        features,
+        calibration["truth"],
+        calibration["base_rate"],
+        calibration["year"],
+        calibration_split=calibration_split,
+        alpha_grid=ee.parse_float_list(args.incremental_alpha_grid),
+        l2_grid=ee.parse_float_list(args.incremental_l2_grid),
+        steps=int(args.calibration_steps),
+        lr=float(args.calibration_lr),
+        l2=float(args.calibration_l2),
+    )
+    missing_models = [name for name in REQUIRED_MODEL_NAMES if name not in models]
+    if missing_models:
+        raise RuntimeError(f"A-F fit is incomplete for {calibration_split}; missing models: {missing_models}")
+    return models, nested_selection_rows
+
+
+def fit_cross_fitted_models(
+    manifests: Sequence[Mapping[str, Any]],
+    calibrations: Sequence[Mapping[str, np.ndarray]],
+    args: argparse.Namespace,
+) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, object]], List[Dict[str, object]]]:
+    """Fit each outer fold's calibrators on its own held-out validation years only."""
+    models_by_fold: Dict[int, Dict[str, Any]] = {}
+    selection_rows: List[Dict[str, object]] = []
+    audit_rows: List[Dict[str, object]] = []
+    for manifest, calibration in zip(manifests, calibrations):
+        fold = int(manifest["source_fold"])
+        source_folds = set(int(v) for v in np.unique(calibration["source_fold"]))
+        fit_years = set(int(v) for v in np.unique(calibration["year"]))
+        expected_fit_years = set(manifest["calibration_years"])
+        test_years = set(manifest["test_years"])
+        train_years = set(manifest["train_years"])
+        if source_folds != {fold}:
+            raise RuntimeError(
+                f"Fold {fold}: cross-fitted calibration rows came from source folds {sorted(source_folds)}."
+            )
+        if not fit_years.issubset(expected_fit_years):
+            raise RuntimeError(
+                f"Fold {fold}: calibration years outside its validation split: "
+                f"{sorted(fit_years - expected_fit_years)}"
+            )
+        if fit_years & test_years:
+            raise RuntimeError(
+                f"Fold {fold}: cross-fitted calibration/test overlap: {sorted(fit_years & test_years)}"
+            )
+        if train_years & test_years:
+            raise RuntimeError(f"Fold {fold}: source model train/test overlap: {sorted(train_years & test_years)}")
+        models, nested_rows = fit_models_from_calibration(
+            calibration,
+            calibration_split=f"fold{fold}_own_validation",
+            args=args,
+        )
+        models_by_fold[fold] = models
+        selection_rows.extend({"source_fold": fold, **row} for row in nested_rows)
+        audit_rows.append({
+            "source_fold": fold,
+            "fit_source": "same_fold_validation_only",
+            "fit_years": " ".join(str(v) for v in sorted(fit_years)),
+            "test_years": " ".join(str(v) for v in sorted(test_years)),
+            "source_model_train_years": " ".join(str(v) for v in sorted(train_years)),
+            "fit_test_overlap": len(fit_years & test_years),
+            "source_model_train_test_overlap": len(train_years & test_years),
+            "fit_rows": int(calibration["truth"].size),
+        })
+        print(
+            f"Cross-fitted fold {fold}: fit A-F on {len(fit_years)} own validation years "
+            f"({int(calibration['truth'].size)} rows), score only {len(test_years)} test years."
+        )
+    return models_by_fold, selection_rows, audit_rows
+
+
 def predict_models(
     models: Mapping[str, Any],
     arrays: Mapping[str, np.ndarray],
@@ -220,6 +303,15 @@ def main() -> None:
     parser.add_argument("--runs", required=True, help="Comma-separated fold run names.")
     parser.add_argument("--window_leads", default="12,13,14,15,16,17,18")
     parser.add_argument("--calibrator", choices=["platt"], default="platt")
+    parser.add_argument(
+        "--fit_mode",
+        choices=["pooled_once", "cross_fitted"],
+        default="pooled_once",
+        help=(
+            "pooled_once fits A-F once on all saved validation rows; cross_fitted fits each "
+            "fold's A-F calibrators on that fold's own validation rows and scores only its test rows."
+        ),
+    )
     parser.add_argument("--input_root", default="exceedance_eval_incremental")
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--expected_folds", type=int, default=5)
@@ -236,11 +328,12 @@ def main() -> None:
     runs = tuple(v.strip() for v in args.runs.split(",") if v.strip())
     window_leads = ee.parse_int_list(args.window_leads)
     input_root = Path(args.input_root)
-    output_dir = ee.ensure_dir(
-        Path(args.output_dir)
-        if args.output_dir
-        else input_root / f"stitched_window_{ee.lead_list_label(window_leads)}"
+    default_output_name = (
+        f"stitched_window_{ee.lead_list_label(window_leads)}"
+        if args.fit_mode == "pooled_once"
+        else f"stitched_cross_fitted_window_{ee.lead_list_label(window_leads)}"
     )
+    output_dir = ee.ensure_dir(Path(args.output_dir) if args.output_dir else input_root / default_output_name)
 
     loaded = [load_fold_inputs(input_root, run_name, window_leads) for run_name in runs]
     manifests = [item[0] for item in loaded]
@@ -262,42 +355,47 @@ def main() -> None:
         "Cross-fold calendar-year overlap audit: "
         f"{len(cross_fold_overlap)} pooled test years also occur in another fold's calibration set."
     )
-    if cross_fold_overlap:
+    if cross_fold_overlap and args.fit_mode == "pooled_once":
         print(
             "WARNING: pooled-once calibration is not globally year-disjoint because the five validation-year "
             "unions rotate across the same record. Interpret this requested pooled-once result as a cross-fold "
             "calibration analysis, not a strictly untouched 43-year final test."
         )
 
-    pooled_cal = concatenate_calibration(calibrations)
-    own_overlap_count = 0
-    for manifest in manifests:
-        fold = int(manifest["source_fold"])
-        rows = pooled_cal["source_fold"] == fold
-        own_overlap_count += int(np.sum(np.isin(pooled_cal["year"][rows], list(manifest["test_years"]))))
-    if own_overlap_count:
-        raise RuntimeError(f"Found {own_overlap_count} own-fold test-year calibration rows.")
-    features = np.column_stack([
-        pooled_cal["init_margin"],
-        pooled_cal["forecast_margin"],
-        pooled_cal["model_sigma"],
-    ]).astype(np.float32)
-    models, nested_selection_rows = ee.fit_incremental_skill_models(
-        features,
-        pooled_cal["truth"],
-        pooled_cal["base_rate"],
-        pooled_cal["year"],
-        calibration_split="pooled_fold_calibration",
-        alpha_grid=ee.parse_float_list(args.incremental_alpha_grid),
-        l2_grid=ee.parse_float_list(args.incremental_l2_grid),
-        steps=int(args.calibration_steps),
-        lr=float(args.calibration_lr),
-        l2=float(args.calibration_l2),
-    )
-    missing_models = [name for name in REQUIRED_MODEL_NAMES if name not in models]
-    if missing_models:
-        raise RuntimeError(f"Pooled A-F fit is incomplete; missing models: {missing_models}")
-    model_names = list(models)
+    fit_audit_rows: List[Dict[str, object]] = []
+    if args.fit_mode == "cross_fitted":
+        models_by_fold, nested_selection_rows, fit_audit_rows = fit_cross_fitted_models(
+            manifests,
+            calibrations,
+            args,
+        )
+        print(
+            "Cross-fitted leakage audit: PASS (each fold's calibrators use only that same fold's "
+            "validation years; its test years are untouched until scoring)."
+        )
+    else:
+        pooled_cal = concatenate_calibration(calibrations)
+        own_overlap_count = 0
+        for manifest in manifests:
+            fold = int(manifest["source_fold"])
+            rows = pooled_cal["source_fold"] == fold
+            own_overlap_count += int(np.sum(np.isin(pooled_cal["year"][rows], list(manifest["test_years"]))))
+        if own_overlap_count:
+            raise RuntimeError(f"Found {own_overlap_count} own-fold test-year calibration rows.")
+        pooled_models, nested_selection_rows = fit_models_from_calibration(
+            pooled_cal,
+            calibration_split="pooled_fold_calibration",
+            args=args,
+        )
+        models_by_fold = {int(manifest["source_fold"]): pooled_models for manifest in manifests}
+    model_names = list(next(iter(models_by_fold.values())))
+    inconsistent_model_sets = {
+        fold: sorted(set(fold_models) ^ set(model_names))
+        for fold, fold_models in models_by_fold.items()
+        if set(fold_models) != set(model_names)
+    }
+    if inconsistent_model_sets:
+        raise RuntimeError(f"A-F model sets differ across folds: {inconsistent_model_sets}")
     pooled_acc = ee.EvaluationAccumulator([REFERENCE_NAME, *model_names], {})
     by_year: Dict[int, ee.EvaluationAccumulator] = defaultdict(
         lambda: ee.EvaluationAccumulator([REFERENCE_NAME, *model_names], {})
@@ -308,6 +406,7 @@ def main() -> None:
     fold_streamed_samples: Counter[int] = Counter()
     for manifest, chunks in chunks_by_fold:
         fold = int(manifest["source_fold"])
+        models = models_by_fold[fold]
         for chunk_path in chunks:
             with np.load(chunk_path, allow_pickle=False) as data:
                 source_fold = int(_scalar(data, "source_fold"))
@@ -375,7 +474,7 @@ def main() -> None:
         )
     per_year_rows, bootstrap_rows = bootstrap_candidates(
         by_year,
-        [name for name in CANDIDATE_NAMES if name in models],
+        [name for name in CANDIDATE_NAMES if name in model_names],
         reps=int(args.bootstrap_reps),
         seed=int(args.seed) + 7001,
     )
@@ -383,6 +482,8 @@ def main() -> None:
     ee.write_csv(output_dir / "pooled_bootstrap_vs_A.csv", bootstrap_rows)
     ee.write_csv(output_dir / "pooled_per_year_metrics_vs_A.csv", per_year_rows)
     ee.write_csv(output_dir / "pooled_fold_audit.csv", audit_rows)
+    if fit_audit_rows:
+        ee.write_csv(output_dir / "cross_fitted_calibration_audit.csv", fit_audit_rows)
     ee.write_csv(
         output_dir / "pooled_cross_fold_overlap_audit.csv",
         [{
@@ -391,24 +492,33 @@ def main() -> None:
             "cross_fold_calendar_year_overlap_count": len(cross_fold_overlap),
             "cross_fold_calendar_year_overlap": " ".join(str(v) for v in cross_fold_overlap),
             "interpretation": (
-                "Pooled-once cross-fold calibration analysis; not a globally untouched final test."
-                if cross_fold_overlap
-                else "Pooled calibration and test year unions are globally disjoint."
+                (
+                    "Cross-fitted scoring is leakage-clean because each fold uses only its own validation rows."
+                    if args.fit_mode == "cross_fitted"
+                    else "Pooled-once cross-fold calibration analysis; not a globally untouched final test."
+                )
+                if cross_fold_overlap else "Calibration and test year unions are globally disjoint."
             ),
         }],
     )
     ee.write_csv(output_dir / "pooled_nested_year_selection.csv", nested_selection_rows)
+    coefficient_models = (
+        [(f"fold{fold}", fold_models) for fold, fold_models in sorted(models_by_fold.items())]
+        if args.fit_mode == "cross_fitted"
+        else [("pooled_once", next(iter(models_by_fold.values())))]
+    )
     ee.write_csv(
         output_dir / "pooled_incremental_coefficients.csv",
         [
-            {"diagnostic_model": name, **row}
-            for name, model in models.items()
+            {"fit_scope": fit_scope, "diagnostic_model": name, **row}
+            for fit_scope, fold_models in coefficient_models
+            for name, model in fold_models.items()
             for row in model.coefficient_rows()
         ],
     )
 
-    print("\nPooled A-through-F incremental table")
-    print("====================================")
+    print(f"\nStitched A-through-F incremental table ({args.fit_mode})")
+    print("=" * 56)
     for row in summary_rows:
         if row["model"] == REFERENCE_NAME:
             continue
@@ -434,10 +544,10 @@ def main() -> None:
         and row["metric"] == "delta_roc_auc_candidate_minus_baseline"
     )
     print(
-        "\nHeadline: Model C pooled delta-ROC-AUC CI versus A "
+        f"\nHeadline ({args.fit_mode}): Model C stitched delta-ROC-AUC CI versus A "
         f"{'EXCLUDES' if c_auc['ci_excludes_zero'] else 'DOES NOT EXCLUDE'} zero."
     )
-    print(f"Saved pooled outputs to: {output_dir}")
+    print(f"Saved stitched outputs to: {output_dir}")
 
 
 if __name__ == "__main__":
