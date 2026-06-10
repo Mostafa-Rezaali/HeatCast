@@ -6,6 +6,7 @@ from forecasts_of_opportunity import (
     OpportunityStats,
     confidence_selections,
     fit_boundaries,
+    retained_percent_from_confidence_stratum,
     roc_auc_from_hist,
     stream_chunks,
     year_block_bootstrap,
@@ -92,6 +93,11 @@ def test_histogram_auc_matches_known_separation():
     pos[-1] = 10
     neg[0] = 10
     assert np.isclose(roc_auc_from_hist(pos, neg), 1.0)
+
+
+def test_confidence_stratum_retained_percent_parser():
+    assert retained_percent_from_confidence_stratum("top_10pct_ge_p90") == 10
+    assert retained_percent_from_confidence_stratum("top_1pct_ge_p99") == 1
 
 
 def test_tiny_fake_fold_streams_three_full_land_chunks(tmp_path: Path):

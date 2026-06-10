@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -279,6 +280,20 @@ def histogram_text(values: np.ndarray) -> str:
     return " ".join(f"{float(value):.12g}" for value in np.asarray(values).reshape(-1))
 
 
+def retained_percent_from_confidence_stratum(stratum: str) -> int:
+    match = re.fullmatch(r"top_(\d+)pct_ge_p(\d+)", str(stratum))
+    if match is None:
+        raise ValueError(f"Invalid confidence stratum label: {stratum!r}")
+    retained_percent = int(match.group(1))
+    threshold_percentile = int(match.group(2))
+    if retained_percent + threshold_percentile != 100:
+        raise ValueError(
+            f"Inconsistent confidence stratum label {stratum!r}: "
+            f"retained {retained_percent}% plus threshold percentile {threshold_percentile} != 100."
+        )
+    return retained_percent
+
+
 def update_stratum(
     global_stats: MutableMapping[Tuple[str, str], OpportunityStats],
     by_year: MutableMapping[Tuple[str, str, int], OpportunityStats],
@@ -447,8 +462,11 @@ def discard_curve_plot(summary_rows: Sequence[Mapping[str, Any]], path: Path) ->
     import matplotlib.pyplot as plt
 
     rows = [row for row in summary_rows if row["axis"] == "confidence" and row["stratum"] != "all"]
-    rows.sort(key=lambda row: int(str(row["stratum"]).split("_")[1]), reverse=True)
-    retained = np.array([int(str(row["stratum"]).split("_")[1]) for row in rows], dtype=float)
+    rows.sort(key=lambda row: retained_percent_from_confidence_stratum(str(row["stratum"])), reverse=True)
+    retained = np.array(
+        [retained_percent_from_confidence_stratum(str(row["stratum"])) for row in rows],
+        dtype=float,
+    )
     bss = np.array([float(row["bss_unconditional"]) for row in rows])
     low = np.array([float(row.get("bss_ci_low", np.nan)) for row in rows])
     high = np.array([float(row.get("bss_ci_high", np.nan)) for row in rows])
