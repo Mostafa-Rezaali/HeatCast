@@ -17,6 +17,7 @@ import numpy as np
 HIST_BINS = 512
 EXPECTED_YEARS = set(range(1981, 2024))
 TOP_CONFIDENCE_PERCENTILE = 90
+DRIVER_AXES = ("mjo_phase", "enso_state", "soil_moisture_tercile")
 _AUC_FROM_HIST = None
 
 
@@ -56,7 +57,145 @@ def fit_boundaries(
         "forecast_margin_edges": percentile_edges(
             np.abs(np.asarray(calibration["forecast_margin"])), range(10, 100, 10)
         ),
+        "sigma_bottom_tercile_edge": np.array(
+            percentile_edges(np.asarray(calibration["model_sigma"]), [100.0 / 3.0])[0],
+            dtype=np.float64,
+        ),
     }
+
+
+def mjo_stratum(phase: int, amplitude: float) -> str:
+    if not np.isfinite(amplitude) or int(phase) not in range(1, 9):
+        raise RuntimeError(f"Invalid MJO phase/amplitude at init: phase={phase}, amplitude={amplitude}.")
+    return "inactive" if float(amplitude) < 1.0 else f"phase_{int(phase)}"
+
+
+def enso_stratum(nino34: float) -> str:
+    if not np.isfinite(nino34):
+        raise RuntimeError("Missing Nino3.4 value at init.")
+    if float(nino34) >= 0.5:
+        return "el_nino"
+    if float(nino34) <= -0.5:
+        return "la_nina"
+    return "neutral"
+
+
+def soil_tercile_selections(percentile: np.ndarray) -> Dict[str, np.ndarray]:
+    values = np.asarray(percentile)
+    finite = np.isfinite(values)
+    return {
+        "dry": finite & (values <= 33.0),
+        "mid": finite & (values > 33.0) & (values < 67.0),
+        "wet": finite & (values >= 67.0),
+        "undefined": ~finite,
+    }
+
+
+def load_init_sidecar(root: Path) -> Dict[int, int]:
+    path = Path(root) / "incremental_arrays" / "init_dates.npz"
+    if not path.exists():
+        return {}
+    with np.load(path, allow_pickle=False) as data:
+        return {
+            int(sample): int(init_t)
+            for sample, init_t in zip(data["sample_index"], data["init_time_index"])
+        }
+
+
+def resolve_chunk_init_time(
+    chunk_path: Path,
+    chunk_data: Mapping[str, np.ndarray],
+    sidecar: Mapping[int, int],
+) -> int:
+    init_t = (
+        int(np.asarray(chunk_data["init_time_index"]).item())
+        if "init_time_index" in chunk_data
+        else -1
+    )
+    if init_t >= 0:
+        return init_t
+    sample_index = int(Path(chunk_path).stem.split("_")[-1])
+    if sample_index in sidecar:
+        return int(sidecar[sample_index])
+    raise RuntimeError(
+        f"{chunk_path}: missing a usable init_time_index. Run recover_chunk_init_dates.py "
+        "for legacy chunks before slow-driver stratification."
+    )
+
+
+@dataclass
+class DriverLookup:
+    mjo_phase: np.ndarray
+    mjo_amplitude: np.ndarray
+    nino34: np.ndarray
+    sidecars: Mapping[int, Mapping[int, int]]
+    soil_rows: Mapping[int, Mapping[int, int]]
+    soil_memmaps: Mapping[int, np.memmap]
+
+    def sample_strata(
+        self,
+        fold: int,
+        chunk_path: Path,
+        chunk_data: Mapping[str, np.ndarray],
+    ) -> Tuple[int, Dict[str, Dict[str, np.ndarray]]]:
+        init_t = resolve_chunk_init_time(chunk_path, chunk_data, self.sidecars.get(fold, {}))
+        if init_t < 0 or init_t >= len(self.mjo_phase):
+            raise RuntimeError(f"{chunk_path}: init_time_index={init_t} outside driver table.")
+        soil_row = self.soil_rows.get(fold, {}).get(init_t)
+        if soil_row is None:
+            raise RuntimeError(f"{chunk_path}: no fold-{fold} soil-percentile row for init {init_t}.")
+        soil = np.asarray(self.soil_memmaps[fold][soil_row], dtype=np.float32)
+        full = np.ones(soil.shape, dtype=bool)
+        return init_t, {
+            "mjo_phase": {mjo_stratum(self.mjo_phase[init_t], self.mjo_amplitude[init_t]): full},
+            "enso_state": {enso_stratum(self.nino34[init_t]): full},
+            "soil_moisture_tercile": soil_tercile_selections(soil),
+        }
+
+
+def load_driver_lookup(
+    driver_table_dir: Path,
+    manifests: Sequence[Mapping[str, Any]],
+    land_count: int,
+) -> DriverLookup:
+    global_path = Path(driver_table_dir) / "mjo_enso_by_init.npz"
+    if not global_path.exists():
+        raise FileNotFoundError(f"Missing slow-driver table: {global_path}")
+    with np.load(global_path, allow_pickle=False) as data:
+        phase = np.asarray(data["mjo_phase"], dtype=np.int8)
+        amplitude = np.asarray(data["mjo_amplitude"], dtype=np.float32)
+        nino34 = np.asarray(data["nino34"], dtype=np.float32)
+    if not (phase.size == amplitude.size == nino34.size):
+        raise RuntimeError("Global slow-driver arrays have inconsistent lengths.")
+    sidecars: Dict[int, Mapping[int, int]] = {}
+    soil_rows: Dict[int, Mapping[int, int]] = {}
+    soil_memmaps: Dict[int, np.memmap] = {}
+    for manifest in manifests:
+        fold = int(manifest["source_fold"])
+        sidecars[fold] = load_init_sidecar(Path(manifest["root"]))
+        index_path = Path(driver_table_dir) / f"fold{fold}_smpct_index.npz"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Missing fold-safe soil table index: {index_path}")
+        with np.load(index_path, allow_pickle=False) as data:
+            init_indices = np.asarray(data["init_time_index"], dtype=np.int32)
+            shape = tuple(int(value) for value in np.asarray(data["shape"]).tolist())
+            data_file = str(np.asarray(data["data_file"]).item())
+            train_years = set(int(value) for value in np.asarray(data["train_years"]).tolist())
+            undefined_fraction = float(np.asarray(data["undefined_fraction"]).item())
+        if train_years != set(int(value) for value in manifest["train_years"]):
+            raise RuntimeError(f"Fold {fold}: soil table train years do not match manifest.")
+        if len(shape) != 2 or shape[1] != int(land_count):
+            raise RuntimeError(f"Fold {fold}: soil memmap shape={shape}, expected second dim={land_count}.")
+        if undefined_fraction >= 0.05:
+            raise RuntimeError(f"Fold {fold}: cached undefined soil fraction={undefined_fraction:.4f} >= 0.05.")
+        soil_rows[fold] = {int(init_t): row for row, init_t in enumerate(init_indices)}
+        soil_memmaps[fold] = np.memmap(
+            Path(driver_table_dir) / data_file,
+            mode="r",
+            dtype=np.float16,
+            shape=shape,
+        )
+    return DriverLookup(phase, amplitude, nino34, sidecars, soil_rows, soil_memmaps)
 
 
 def assign_deciles(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -250,6 +389,50 @@ def year_block_bootstrap(
     return output
 
 
+def year_block_bootstrap_axes(
+    by_year: Mapping[Tuple[str, str, int], OpportunityStats],
+    axes: Sequence[str],
+    years: Sequence[int],
+    reps: int,
+    seed: int,
+) -> Dict[Tuple[str, str], Dict[str, float]]:
+    """Bootstrap requested strata over whole years, preserving both BSS references."""
+    years_array = np.asarray(sorted(int(year) for year in years), dtype=np.int16)
+    if years_array.size < 2:
+        raise RuntimeError("Year-block bootstrap requires at least two independent years.")
+    requested = {
+        (axis, stratum)
+        for axis, stratum, _ in by_year
+        if axis in set(str(value) for value in axes)
+    }
+    rng = np.random.default_rng(int(seed))
+    samples: Dict[Tuple[str, str], Dict[str, List[float]]] = {
+        key: {"bss_unconditional": [], "bss_conditional": [], "roc_auc": []}
+        for key in requested
+    }
+    for _ in range(int(reps)):
+        sampled = rng.choice(years_array, size=years_array.size, replace=True)
+        unique, counts = np.unique(sampled, return_counts=True)
+        weights = {int(year): int(count) for year, count in zip(unique, counts)}
+        for axis, stratum in requested:
+            metrics = aggregate_year_stats(by_year, axis, stratum, weights).metrics()
+            for name in samples[(axis, stratum)]:
+                samples[(axis, stratum)][name].append(metrics[name])
+    output: Dict[Tuple[str, str], Dict[str, float]] = {}
+    for key, metrics in samples.items():
+        output[key] = {}
+        for name, values in metrics.items():
+            finite = np.asarray(values, dtype=np.float64)
+            finite = finite[np.isfinite(finite)]
+            output[key][f"{name}_ci_low"] = (
+                float(np.percentile(finite, 2.5)) if finite.size else float("nan")
+            )
+            output[key][f"{name}_ci_high"] = (
+                float(np.percentile(finite, 97.5)) if finite.size else float("nan")
+            )
+    return output
+
+
 def confidence_selections(
     confidence: np.ndarray,
     percentiles: Sequence[int],
@@ -316,12 +499,15 @@ def stream_chunks(
     land_count: int,
     region_land_masks: Mapping[str, np.ndarray],
     confidence_percentiles: Sequence[int],
+    driver_lookup: Optional[DriverLookup] = None,
     progress_every: int = 250,
 ) -> Tuple[Dict[Tuple[str, str], OpportunityStats], Dict[Tuple[str, str, int], OpportunityStats], set[int]]:
     global_stats: Dict[Tuple[str, str], OpportunityStats] = defaultdict(OpportunityStats)
     by_year: Dict[Tuple[str, str, int], OpportunityStats] = defaultdict(OpportunityStats)
     observed_years: set[int] = set()
     processed = 0
+    soil_undefined = 0
+    soil_total = 0
     for manifest, model_c, boundaries, chunks in fold_inputs:
         fold = int(manifest["source_fold"])
         test_years = set(int(year) for year in manifest["test_years"])
@@ -339,6 +525,11 @@ def stream_chunks(
                 year = int(np.asarray(data["year"]).item())
                 month = int(np.asarray(data["month"]).item())
                 source_fold = int(np.asarray(data["source_fold"]).item())
+                driver_selections = (
+                    driver_lookup.sample_strata(fold, chunk_path, data)[1]
+                    if driver_lookup is not None
+                    else None
+                )
             if source_fold != fold or year not in test_years:
                 raise RuntimeError(
                     f"{chunk_path}: fold/year mismatch, got fold={source_fold}, year={year}; "
@@ -382,6 +573,30 @@ def stream_chunks(
             )
             top_decile_name = f"top_10pct_ge_p{TOP_CONFIDENCE_PERCENTILE}"
             top_decile = dict(selections)[top_decile_name]
+            if driver_selections is not None:
+                low_sigma = (
+                    np.asarray(arrays["model_sigma"])
+                    <= float(np.asarray(boundaries["sigma_bottom_tercile_edge"]).item())
+                )
+                for driver_axis, strata in driver_selections.items():
+                    for stratum, driver_selection in strata.items():
+                        update_stratum(
+                            global_stats, by_year, driver_axis, stratum, year,
+                            probability, truth, base_rate, driver_selection,
+                        )
+                        update_stratum(
+                            global_stats, by_year, f"{driver_axis}_x_top_confidence",
+                            f"{stratum}__{top_decile_name}", year,
+                            probability, truth, base_rate, driver_selection & top_decile,
+                        )
+                        update_stratum(
+                            global_stats, by_year, f"{driver_axis}_x_low_sigma",
+                            f"{stratum}__bottom_sigma_tercile", year,
+                            probability, truth, base_rate, driver_selection & low_sigma,
+                        )
+                    if driver_axis == "soil_moisture_tercile":
+                        soil_undefined += int(np.sum(strata["undefined"]))
+                        soil_total += int(land_count)
             for region_name, region_selection in region_land_masks.items():
                 update_stratum(
                     global_stats, by_year, "region", region_name, year,
@@ -395,12 +610,20 @@ def stream_chunks(
             processed += 1
             if processed % int(progress_every) == 0:
                 print(f"  streamed {processed} test chunks")
+    if driver_lookup is not None:
+        undefined_fraction = soil_undefined / max(soil_total, 1)
+        if undefined_fraction >= 0.05:
+            raise RuntimeError(
+                f"Streamed undefined soil-percentile fraction={undefined_fraction:.4f} >= 0.05."
+            )
+        print(f"Slow-driver hot-loop audit: PASS (soil undefined={undefined_fraction:.4%}; no NetCDF reads)")
     return global_stats, by_year, observed_years
 
 
 def build_summary_rows(
     global_stats: Mapping[Tuple[str, str], OpportunityStats],
     bootstrap: Mapping[str, Mapping[str, float]],
+    axis_bootstrap: Optional[Mapping[Tuple[str, str], Mapping[str, float]]] = None,
 ) -> List[Dict[str, Any]]:
     pooled_bss = global_stats[("confidence", "all")].metrics()["bss_unconditional"]
     rows: List[Dict[str, Any]] = []
@@ -410,6 +633,14 @@ def build_summary_rows(
         if axis == "confidence":
             row.update(bootstrap.get(stratum, {}))
             row["delta_bss_vs_pooled"] = metrics["bss_unconditional"] - pooled_bss
+        if axis_bootstrap is not None:
+            row.update(axis_bootstrap.get((axis, stratum), {}))
+        if "_x_" in axis and "__" in stratum:
+            parent_axis = axis.split("_x_", 1)[0]
+            parent_stratum = stratum.split("__", 1)[0]
+            parent = global_stats.get((parent_axis, parent_stratum))
+            if parent is not None and parent.count > 0:
+                row["retained_fraction_within_driver"] = metrics["n"] / parent.count
         rows.append(row)
     return rows
 
@@ -480,6 +711,64 @@ def discard_curve_plot(summary_rows: Sequence[Mapping[str, Any]], path: Path) ->
     plt.close(fig)
 
 
+def driver_conditional_bss_plot(
+    summary_rows: Sequence[Mapping[str, Any]],
+    path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    mjo_order = [f"phase_{phase}" for phase in range(1, 9)]
+    soil_order = ["dry", "mid", "wet"]
+    panels = [
+        ("mjo_phase", mjo_order, "Active MJO phase"),
+        ("soil_moisture_tercile", soil_order, "Antecedent soil moisture"),
+    ]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+    for ax, (axis, order, title) in zip(axes, panels):
+        indexed = {
+            str(row["stratum"]): row
+            for row in summary_rows
+            if row["axis"] == axis
+        }
+        rows = [indexed[name] for name in order if name in indexed]
+        labels = [str(row["stratum"]).replace("phase_", "P").replace("_", " ") for row in rows]
+        values = np.asarray([float(row["bss_conditional"]) for row in rows])
+        low = np.asarray([float(row.get("bss_conditional_ci_low", np.nan)) for row in rows])
+        high = np.asarray([float(row.get("bss_conditional_ci_high", np.nan)) for row in rows])
+        yerr = np.vstack([np.maximum(values - low, 0.0), np.maximum(high - values, 0.0)])
+        ax.bar(np.arange(len(rows)), values, color="#176b87")
+        ax.errorbar(np.arange(len(rows)), values, yerr=yerr, fmt="none", color="black", capsize=3)
+        ax.axhline(0.0, color="0.5", linestyle="--", linewidth=1)
+        ax.set_xticks(np.arange(len(rows)), labels)
+        ax.set(title=title, ylabel="Conditional BSS")
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def print_driver_verdicts(
+    global_stats: Mapping[Tuple[str, str], OpportunityStats],
+    axis_bootstrap: Mapping[Tuple[str, str], Mapping[str, float]],
+) -> None:
+    pooled = global_stats[("confidence", "all")].metrics()["bss_unconditional"]
+    for axis in DRIVER_AXES:
+        candidates = [
+            (stratum, stats.metrics())
+            for (candidate_axis, stratum), stats in global_stats.items()
+            if candidate_axis == axis and stratum != "undefined"
+        ]
+        if not candidates:
+            continue
+        stratum, metrics = max(candidates, key=lambda item: item[1]["bss_unconditional"])
+        ci = axis_bootstrap.get((axis, stratum), {})
+        low = float(ci.get("bss_unconditional_ci_low", np.nan))
+        high = float(ci.get("bss_unconditional_ci_high", np.nan))
+        print(
+            f"DRIVER {axis}: best stratum {stratum} "
+            f"BSS={metrics['bss_unconditional']:+.4f} CI=[{low:+.4f},{high:+.4f}] "
+            f"vs pooled {pooled:+.4f}"
+        )
+
+
 def run(args: argparse.Namespace) -> None:
     global _AUC_FROM_HIST
 
@@ -492,6 +781,7 @@ def run(args: argparse.Namespace) -> None:
     run_names = parse_str_list(args.run_names)
     window_leads = parse_int_list(args.window_leads)
     confidence_percentiles = parse_int_list(args.confidence_percentiles)
+    bootstrap_axes = parse_str_list(args.bootstrap_axes)
     if TOP_CONFIDENCE_PERCENTILE not in confidence_percentiles:
         raise ValueError(
             f"--confidence_percentiles must include {TOP_CONFIDENCE_PERCENTILE} for the headline top-decile test."
@@ -560,11 +850,19 @@ def run(args: argparse.Namespace) -> None:
         for name, mask in region_masks(land_mask.shape).items()
     }
     fold_inputs = list(zip(manifests, models, boundaries, chunk_lists))
+    driver_lookup = (
+        load_driver_lookup(Path(args.driver_table_dir), manifests, land_count)
+        if args.driver_table_dir
+        else None
+    )
+    if bootstrap_axes and driver_lookup is None:
+        raise ValueError("--bootstrap_axes requires --driver_table_dir.")
     global_stats, by_year, observed_years = stream_chunks(
         fold_inputs,
         land_count,
         region_land_masks,
         confidence_percentiles,
+        driver_lookup=driver_lookup,
         progress_every=250,
     )
     if observed_years != EXPECTED_YEARS:
@@ -603,13 +901,41 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("Bootstrap reproducibility assert failed.")
     print(f"Year-block bootstrap reproducibility: PASS ({len(observed_years)} independent year blocks)")
 
-    summary_rows = build_summary_rows(global_stats, bootstrap)
+    expanded_bootstrap_axes = tuple(dict.fromkeys(
+        candidate
+        for axis in bootstrap_axes
+        for candidate in (axis, f"{axis}_x_top_confidence", f"{axis}_x_low_sigma")
+    ))
+    axis_bootstrap = (
+        year_block_bootstrap_axes(
+            by_year,
+            expanded_bootstrap_axes,
+            sorted(observed_years),
+            reps=int(args.n_bootstrap),
+            seed=int(args.seed),
+        )
+        if bootstrap_axes
+        else {}
+    )
+    summary_rows = build_summary_rows(global_stats, bootstrap, axis_bootstrap)
     by_year_rows = build_by_year_rows(by_year)
     write_csv(out_dir / "opportunity_summary.csv", summary_rows)
     write_csv(out_dir / "opportunity_by_year.csv", by_year_rows)
     reliability_plot(global_stats[("confidence", "all")], out_dir / "reliability_pooled.png", "Pooled Model C reliability")
     reliability_plot(global_stats[("confidence", top_stratum)], out_dir / "reliability_top_band.png", "Top-decile Model C reliability")
     discard_curve_plot(summary_rows, out_dir / "bss_vs_confidence_percentile.png")
+    if driver_lookup is not None:
+        driver_rows = [
+            row for row in summary_rows
+            if any(str(row["axis"]).startswith(axis) for axis in DRIVER_AXES)
+        ]
+        write_csv(out_dir / "driver_opportunity_summary.csv", driver_rows)
+        driver_conditional_bss_plot(driver_rows, out_dir / "driver_conditional_bss.png")
+        print(
+            "Slow-driver leakage audit: PASS (MJO/ENSO are external init-date indices; "
+            "soil percentiles and interaction boundaries use fold train/calibration years only; "
+            "no test outcomes define strata)."
+        )
 
     top = global_stats[("confidence", top_stratum)].metrics()
     pooled = global_stats[("confidence", "all")].metrics()
@@ -633,6 +959,8 @@ def run(args: argparse.Namespace) -> None:
         f"CI=[{top_ci['bss_ci_low']:+.4f},{top_ci['bss_ci_high']:+.4f}] "
         f"vs pooled BSS={pooled['bss_unconditional']:+.4f}"
     )
+    if driver_lookup is not None:
+        print_driver_verdicts(global_stats, axis_bootstrap)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -649,6 +977,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out_dir", default=None)
     parser.add_argument("--n_bootstrap", type=int, default=2000)
     parser.add_argument("--confidence_percentiles", default="50,80,90,95,99")
+    parser.add_argument(
+        "--driver_table_dir",
+        default=None,
+        help="Cached output directory from build_driver_tables.py. Omit to preserve the original analysis.",
+    )
+    parser.add_argument(
+        "--bootstrap_axes",
+        default="",
+        help="Comma-separated slow-driver axes to year-block bootstrap.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser
 

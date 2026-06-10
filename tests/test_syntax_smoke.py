@@ -15,6 +15,8 @@ CORE_SCRIPTS = (
     "bootstrap_significance.py",
     "exceedance_eval.py",
     "forecasts_of_opportunity.py",
+    "recover_chunk_init_dates.py",
+    "build_driver_tables.py",
     "ens_common.py",
     "ens_ingest.py",
     "ens_score.py",
