@@ -5,9 +5,9 @@ MARS requests queue server-side, so this downloader may run on a HiPerGator
 login node. The subsequent ingestion and scoring stages remain Slurm jobs.
 
 Prerequisites:
-  pip install ecmwf-api-client --user
-  Register at https://apps.ecmwf.int, accept the S2S license at
-  https://apps.ecmwf.int/datasets/data/s2s, and configure ~/.ecmwfapirc.
+  pip install "cdsapi>=0.7.7" --user
+  Register at https://ecds.ecmwf.int, accept the S2S reforecasts license at
+  https://ecds.ecmwf.int/datasets/s2s-reforecasts, and configure ~/.cdsapirc.
   Load ecCodes so grib_copy is available.
 
 Outputs:
@@ -35,7 +35,7 @@ def mjjas_mon_thu(year: int) -> Iterable[date]:
 
 
 def retrieve(
-    server,
+    client,
     model_date: date,
     hdates: Sequence[date],
     kind: str,
@@ -45,7 +45,6 @@ def retrieve(
 ) -> None:
     request = {
         "class": "s2",
-        "dataset": "s2s",
         "expver": "prod",
         "model": "glob",
         "origin": "ecmf",
@@ -59,11 +58,10 @@ def retrieve(
         "grid": "1.5/1.5",
         "area": str(area),
         "type": str(kind),
-        "target": str(target),
     }
     if kind == "pf":
         request["number"] = "1/2/3/4/5/6/7/8/9/10"
-    server.retrieve(request)
+    client.retrieve("s2s-reforecasts", request, str(target))
 
 
 def split_by_hdate(grib_path: Path, out_dir: Path) -> None:
@@ -139,12 +137,12 @@ def main() -> None:
 
     if not args.skip_download:
         try:
-            from ecmwfapi import ECMWFDataServer
+            import cdsapi
         except ImportError as exc:
             raise RuntimeError(
-                "Missing ecmwf-api-client. Install it and configure ~/.ecmwfapirc."
+                "Missing cdsapi>=0.7.7. Install it and configure ~/.cdsapirc for ECDS."
             ) from exc
-        server = ECMWFDataServer()
+        client = cdsapi.Client()
         for model_date in model_dates:
             hdates = hindcast_dates(model_date, args.hindcast_years)
             for kind in ("cf", "pf"):
@@ -153,7 +151,7 @@ def main() -> None:
                     print(f"  exists, skipping: {target.name}")
                     continue
                 print(f"  retrieving {target.name} ({len(hdates)} hdates)...")
-                retrieve(server, model_date, hdates, kind, target, args.area, max_step_hours)
+                retrieve(client, model_date, hdates, kind, target, args.area, max_step_hours)
 
     labels = assemble_by_hdate(downloads, parts, raw_dir)
     print(f"Done: {len(labels)} init files in {raw_dir}, labels in init_list.txt")

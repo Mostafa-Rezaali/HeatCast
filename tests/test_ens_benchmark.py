@@ -9,7 +9,7 @@ from ens_common import (
     intersection_years,
     member_fraction_probability,
 )
-from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu
+from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu, retrieve
 from ens_ingest import load_init_list
 from stitch_exceedance_folds import load_fold_inputs
 
@@ -103,3 +103,26 @@ def test_s2s_download_dates_and_ingest_init_list(tmp_path: Path):
     init_list = tmp_path / "init_list.txt"
     init_list.write_text("20020502\n20020502\n20020506\n", encoding="utf-8")
     assert load_init_list(init_list) == ["20020502", "20020506"]
+
+
+def test_s2s_retrieve_uses_current_ecds_dataset(tmp_path: Path):
+    calls = []
+
+    class Client:
+        def retrieve(self, dataset, request, target):
+            calls.append((dataset, request, target))
+
+    retrieve(
+        Client(),
+        model_date=list(mjjas_mon_thu(2022))[0],
+        hdates=[hindcast_dates(list(mjjas_mon_thu(2022))[0], 1)[0]],
+        kind="pf",
+        target=tmp_path / "out.grib",
+        area="50/-125/24/-66",
+        max_step_hours=24,
+    )
+    dataset, request, target = calls[0]
+    assert dataset == "s2s-reforecasts"
+    assert request["number"] == "1/2/3/4/5/6/7/8/9/10"
+    assert "dataset" not in request and "target" not in request
+    assert target.endswith("out.grib")
