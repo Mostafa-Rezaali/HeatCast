@@ -290,6 +290,7 @@ class Config:
     TUBE_LOSS_CENTER_WEIGHT = 0.10
     TUBE_LOSS_WEEKLY_WEIGHT = 0.10
     TUBE_TEMPORAL_HEADS = 4
+    TUBE_DECODE_CHUNK_SIZE = 0
     GRADIENT_LOSS_WEIGHT = 0.0
     DISTRIBUTIONAL_HEAD = False
     CRPS_LOSS = False
@@ -624,6 +625,11 @@ def print_config_banner():
             f"Prediction tube: leads {prediction_leads(Config)} days "
             f"(center t+{Config.LEAD_TIME}); same-init {tube_mean_display_label(Config)} enabled"
         )
+        if Config.TUBE_DECODE_CHUNK_SIZE > 0:
+            print(
+                f"Tube decoder: {Config.TUBE_DECODE_CHUNK_SIZE} leads/chunk "
+                "(activation checkpointing during training)"
+            )
     else:
         print(f"Lead time: {Config.LEAD_TIME} days DIRECT (no rollout)")
     print(f"Sampling Steps: {Config.CFM_SAMPLING_STEPS} {'(ignored in deterministic)' if Config.DETERMINISTIC else ''}")
@@ -3978,6 +3984,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
         multi_lead_tube=Config.MULTI_LEAD_TUBE,
         prediction_leads=prediction_leads(Config),
         tube_temporal_heads=Config.TUBE_TEMPORAL_HEADS,
+        tube_decode_chunk_size=Config.TUBE_DECODE_CHUNK_SIZE,
         tube_loss_weights=(
             Config.TUBE_LOSS_DAILY_WEIGHT,
             Config.TUBE_LOSS_CENTER_WEIGHT,
@@ -4484,6 +4491,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     "image_channels": int(Config.IMAGE_CHANNELS),
                     "multi_lead_tube": bool(Config.MULTI_LEAD_TUBE),
                     "prediction_leads": tuple(int(x) for x in prediction_leads(Config)),
+                    "tube_decode_chunk_size": int(Config.TUBE_DECODE_CHUNK_SIZE),
                 }
                 torch.save(ckpt, os.path.join(Config.CHECKPOINT_DIR,
                                                f"checkpoint_epoch_{epoch+1:04d}.pth"))
@@ -4570,6 +4578,8 @@ def main():
                        help='Tube loss weight for same-init weekly-mean MSE.')
     parser.add_argument('--tube_temporal_heads', type=int, default=None,
                        help='Number of attention heads for temporal mesh attention in tube mode.')
+    parser.add_argument('--tube_decode_chunk_size', type=int, default=None,
+                       help='Decode this many tube leads at a time; enables decoder activation checkpointing during training.')
     parser.add_argument('--gradient_loss_weight', type=float, default=None,
                        help='Blend weight for masked spatial finite-difference gradient loss.')
     parser.add_argument('--distributional_head', action='store_true',
@@ -4707,6 +4717,10 @@ def main():
         Config.TUBE_LOSS_WEEKLY_WEIGHT = args.tube_loss_weekly_weight
     if args.tube_temporal_heads is not None:
         Config.TUBE_TEMPORAL_HEADS = args.tube_temporal_heads
+    if args.tube_decode_chunk_size is not None:
+        if args.tube_decode_chunk_size < 0:
+            raise ValueError("--tube_decode_chunk_size must be non-negative.")
+        Config.TUBE_DECODE_CHUNK_SIZE = int(args.tube_decode_chunk_size)
     if args.gradient_loss_weight is not None:
         if args.gradient_loss_weight < 0.0 or args.gradient_loss_weight >= 1.0:
             raise ValueError("--gradient_loss_weight must be in [0, 1).")
@@ -4963,6 +4977,7 @@ def _load_meshflownet_checkpoint(checkpoint_path, mesh, device):
         multi_lead_tube=Config.MULTI_LEAD_TUBE,
         prediction_leads=prediction_leads(Config),
         tube_temporal_heads=Config.TUBE_TEMPORAL_HEADS,
+        tube_decode_chunk_size=Config.TUBE_DECODE_CHUNK_SIZE,
         tube_loss_weights=(
             Config.TUBE_LOSS_DAILY_WEIGHT,
             Config.TUBE_LOSS_CENTER_WEIGHT,
@@ -5169,6 +5184,7 @@ def _test(args):
         multi_lead_tube=Config.MULTI_LEAD_TUBE,
         prediction_leads=prediction_leads(Config),
         tube_temporal_heads=Config.TUBE_TEMPORAL_HEADS,
+        tube_decode_chunk_size=Config.TUBE_DECODE_CHUNK_SIZE,
         tube_loss_weights=(
             Config.TUBE_LOSS_DAILY_WEIGHT,
             Config.TUBE_LOSS_CENTER_WEIGHT,

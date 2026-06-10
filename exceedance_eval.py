@@ -90,6 +90,7 @@ def configure_from_args(args: argparse.Namespace) -> None:
         cfm.Config.MULTI_LEAD_TUBE = False
 
     cfm.Config.GRADIENT_LOSS_WEIGHT = 0.0
+    cfm.Config.TUBE_DECODE_CHUNK_SIZE = max(0, int(args.tube_decode_chunk_size))
     if getattr(args, "use_model_sigma", False):
         cfm.Config.DISTRIBUTIONAL_HEAD = True
         cfm.Config.IMAGE_CHANNELS = 2
@@ -3579,6 +3580,7 @@ def main() -> None:
     parser.add_argument("--cv_stride", type=int, default=5)
     parser.add_argument("--multi_lead_tube", action="store_true")
     parser.add_argument("--prediction_leads", default="12,13,14,15,16,17,18")
+    parser.add_argument("--tube_decode_chunk_size", type=int, default=0, help="Decode this many tube leads at a time to bound GPU memory; 0 decodes all leads together.")
     parser.add_argument("--target_mode", choices=["daily", "window"], default="daily")
     parser.add_argument("--window_leads", default=None, help="Comma-separated lead offsets for --target_mode window; defaults to predicted tube leads.")
     parser.add_argument("--use_model_sigma", action="store_true", help="Use distributional model sigma in Phi((mu-q95)/sigma) instead of cached sigma.")

@@ -26,7 +26,7 @@ cd "$WORK_DIR"
 module load cuda/12.9.1
 unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 git pull --ff-only origin codex/tube_v1
 "$PY" -m py_compile exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
@@ -53,6 +53,7 @@ for FOLD in 0 1 2 3 4; do
       --cv_fold "$FOLD" \
       --checkpoint "$CHECKPOINT" \
       --prediction_leads "$LEADS" \
+      --tube_decode_chunk_size 2 \
       --target_mode window \
       --window_leads "$LEADS" \
       --use_model_sigma \

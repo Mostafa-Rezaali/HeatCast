@@ -30,6 +30,7 @@ CHANGES:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 import math
 from icosahedral_mesh import IcosahedralMesh, grid_to_flat, flat_to_grid
@@ -366,6 +367,7 @@ class MeshFlowNet(nn.Module):
         multi_lead_tube=False,
         prediction_leads=(15,),
         tube_temporal_heads=4,
+        tube_decode_chunk_size=0,
         tube_loss_weights=(0.80, 0.10, 0.10),
         gradient_loss_weight=0.0,
         enable_exceedance_head=False,
@@ -384,6 +386,7 @@ class MeshFlowNet(nn.Module):
         self.prediction_leads = tuple(int(x) for x in prediction_leads)
         self.tube_num_leads = len(self.prediction_leads)
         self.center_lead = 15 if 15 in self.prediction_leads else self.prediction_leads[self.tube_num_leads // 2]
+        self.tube_decode_chunk_size = max(0, int(tube_decode_chunk_size))
         self.tube_loss_weights = tuple(float(x) for x in tube_loss_weights)
         self.gradient_loss_weight = float(gradient_loss_weight)
         self.enable_exceedance_head = bool(enable_exceedance_head)
@@ -483,6 +486,67 @@ class MeshFlowNet(nn.Module):
     def set_mesh(self, mesh):
         self._mesh = mesh
 
+    def _decode_grid_output(self, mesh_features, grid_skip, t_emb, mesh, height, width):
+        grid_out = self.decoder(
+            mesh_features,
+            grid_skip,
+            mesh.m2g_edge_index_t,
+            mesh.m2g_edge_attr_t,
+            t_emb=t_emb,
+        )
+        out = flat_to_grid(grid_out, mesh.grid_node_indices, (height, width), fill_value=0.0)
+        if self.distributional_head:
+            mean_raw = out[:, :1]
+            var_raw = out[:, 1:2]
+            return torch.cat([mean_raw + self.grid_refiner(mean_raw), var_raw], dim=1)
+        return out + self.grid_refiner(out)
+
+    def _decode_tube_output(self, tube_h, grid_skip, t_emb, lead_t_emb, mesh, height, width):
+        batch_size = tube_h.shape[0]
+        decode_chunk_size = self.tube_decode_chunk_size or self.tube_num_leads
+        decode_chunk_size = min(decode_chunk_size, self.tube_num_leads)
+        tube_out = []
+        for start in range(0, self.tube_num_leads, decode_chunk_size):
+            end = min(start + decode_chunk_size, self.tube_num_leads)
+            chunk_leads = end - start
+            chunk_mesh_h = tube_h[:, start:end].reshape(
+                batch_size * chunk_leads, tube_h.shape[2], tube_h.shape[3]
+            )
+            chunk_grid_skip = grid_skip.unsqueeze(1).expand(
+                batch_size, chunk_leads, grid_skip.shape[1], grid_skip.shape[2]
+            ).reshape(batch_size * chunk_leads, grid_skip.shape[1], grid_skip.shape[2])
+            chunk_t_emb = (
+                t_emb.unsqueeze(1) + lead_t_emb[start:end].unsqueeze(0)
+            ).reshape(batch_size * chunk_leads, t_emb.shape[-1])
+
+            def decode_chunk(mesh_features, skip_features, time_features):
+                return self._decode_grid_output(
+                    mesh_features, skip_features, time_features, mesh, height, width
+                )
+
+            if (
+                decode_chunk_size < self.tube_num_leads
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                chunk_out = checkpoint(
+                    decode_chunk,
+                    chunk_mesh_h,
+                    chunk_grid_skip,
+                    chunk_t_emb,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                chunk_out = decode_chunk(chunk_mesh_h, chunk_grid_skip, chunk_t_emb)
+            tube_out.append(
+                chunk_out.reshape(
+                    batch_size, chunk_leads, self.img_channels, height, width
+                )
+            )
+        out = torch.cat(tube_out, dim=1)
+        return out if self.distributional_head else out.squeeze(2)
+
     def forward(self, x, t, cond, global_fields=None):
         """
         Same signature for both modes.
@@ -538,40 +602,13 @@ class MeshFlowNet(nn.Module):
                 B, mesh_h.shape[1], self.tube_num_leads, mesh_h.shape[-1]
             ).permute(0, 2, 1, 3).contiguous()
 
-            flat_mesh_h = tube_h.reshape(B * self.tube_num_leads, mesh_h.shape[1], mesh_h.shape[-1])
-            flat_grid_skip = grid_skip.unsqueeze(1).expand(
-                B, self.tube_num_leads, grid_skip.shape[1], grid_skip.shape[2]
-            ).reshape(B * self.tube_num_leads, grid_skip.shape[1], grid_skip.shape[2])
             lead_t_emb = self.lead_time_proj(lead_emb).to(dtype=t_emb.dtype)
-            flat_t_emb = (t_emb.unsqueeze(1) + lead_t_emb.unsqueeze(0)).reshape(
-                B * self.tube_num_leads, t_emb.shape[-1]
+            return self._decode_tube_output(
+                tube_h, grid_skip, t_emb, lead_t_emb, mesh, H, W
             )
-            grid_out = self.decoder(flat_mesh_h, flat_grid_skip,
-                                    mesh.m2g_edge_index_t, mesh.m2g_edge_attr_t,
-                                    t_emb=flat_t_emb)
-            out = flat_to_grid(grid_out, mesh.grid_node_indices, (H, W), fill_value=0.0)
-            if self.distributional_head:
-                mean_raw = out[:, :1]
-                var_raw = out[:, 1:2]
-                out = torch.cat([mean_raw + self.grid_refiner(mean_raw), var_raw], dim=1)
-                return out.reshape(B, self.tube_num_leads, self.img_channels, H, W)
-            out = out + self.grid_refiner(out)
-            return out.reshape(B, self.tube_num_leads, self.img_channels, H, W).squeeze(2)
 
         # Phase 1: Pass t_emb into decoder for FiLM before output_mlp
-        grid_out = self.decoder(mesh_h, grid_skip,
-                                mesh.m2g_edge_index_t, mesh.m2g_edge_attr_t,
-                                t_emb=t_emb)
-
-        # Phase 3: Reconstruct directly to (H, W). No padding restoration.
-        out = flat_to_grid(grid_out, mesh.grid_node_indices, (H, W), fill_value=0.0)
-        if self.distributional_head:
-            mean_raw = out[:, :1]
-            var_raw = out[:, 1:2]
-            out = torch.cat([mean_raw + self.grid_refiner(mean_raw), var_raw], dim=1)
-            return out
-        out = out + self.grid_refiner(out)
-        return out
+        return self._decode_grid_output(mesh_h, grid_skip, t_emb, mesh, H, W)
 
 
 def count_parameters(model):
