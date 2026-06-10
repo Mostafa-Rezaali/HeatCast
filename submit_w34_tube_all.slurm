@@ -97,9 +97,5 @@ done
 
 echo "ALL FIVE FOLDS COMPLETE"
 
-ARB_JOB_ID=$(sbatch --parsable submit_w34_checkpoint_arbitration.slurm)
-echo "Submitted W34 checkpoint arbitration job: $ARB_JOB_ID"
-
-EVAL_JOB_ID=$(sbatch --parsable --dependency=afterok:${ARB_JOB_ID} submit_w34_eval_stitch.slurm)
+EVAL_JOB_ID=$(sbatch --parsable submit_w34_eval_stitch.slurm)
 echo "Submitted W34 evaluation/stitch job: $EVAL_JOB_ID"
-echo "Evaluation/stitch will start only after checkpoint arbitration succeeds."
