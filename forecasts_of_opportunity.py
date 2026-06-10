@@ -433,6 +433,133 @@ def year_block_bootstrap_axes(
     return output
 
 
+def holm_adjust_pvalues(pvalues: Mapping[Any, float]) -> Dict[Any, float]:
+    """Holm step-down family-wise-error adjustment."""
+    finite = sorted(
+        ((key, float(value)) for key, value in pvalues.items() if np.isfinite(value)),
+        key=lambda item: item[1],
+    )
+    adjusted: Dict[Any, float] = {key: float("nan") for key in pvalues}
+    running = 0.0
+    total = len(finite)
+    for rank, (key, value) in enumerate(finite):
+        running = max(running, min(1.0, (total - rank) * value))
+        adjusted[key] = running
+    return adjusted
+
+
+def interaction_parent_pairs(
+    by_year: Mapping[Tuple[str, str, int], OpportunityStats],
+    top_stratum: str,
+) -> List[Tuple[Tuple[str, str], str, Tuple[str, str]]]:
+    """Return interaction/parent pairs needed for physical opportunity claims."""
+    interactions = sorted({
+        (axis, stratum)
+        for axis, stratum, _ in by_year
+        if axis.endswith("_x_top_confidence") or axis.endswith("_x_low_sigma")
+    })
+    pairs: List[Tuple[Tuple[str, str], str, Tuple[str, str]]] = []
+    for axis, stratum in interactions:
+        if "__" not in stratum:
+            continue
+        driver_axis = axis.split("_x_", 1)[0]
+        driver_stratum = stratum.split("__", 1)[0]
+        selection_parent = (
+            ("confidence", top_stratum)
+            if axis.endswith("_x_top_confidence")
+            else ("low_sigma", "bottom_sigma_tercile")
+        )
+        pairs.append(((axis, stratum), "selection_parent", selection_parent))
+        pairs.append(((axis, stratum), "driver_parent", (driver_axis, driver_stratum)))
+    return pairs
+
+
+def paired_year_block_bootstrap_interactions(
+    global_stats: Mapping[Tuple[str, str], OpportunityStats],
+    by_year: Mapping[Tuple[str, str, int], OpportunityStats],
+    years: Sequence[int],
+    top_stratum: str,
+    reps: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Compare each interaction with its selection and driver parents using paired year blocks."""
+    years_array = np.asarray(sorted(int(year) for year in years), dtype=np.int16)
+    if years_array.size < 2:
+        raise RuntimeError("Paired interaction bootstrap requires at least two independent years.")
+    pairs = interaction_parent_pairs(by_year, top_stratum)
+    metrics = ("bss_unconditional", "bss_conditional")
+    samples: Dict[Tuple[Tuple[str, str], str, Tuple[str, str], str], List[float]] = {
+        (interaction, parent_kind, parent, metric): []
+        for interaction, parent_kind, parent in pairs
+        for metric in metrics
+    }
+    rng = np.random.default_rng(int(seed))
+    for _ in range(int(reps)):
+        sampled = rng.choice(years_array, size=years_array.size, replace=True)
+        unique, counts = np.unique(sampled, return_counts=True)
+        weights = {int(year): int(count) for year, count in zip(unique, counts)}
+        required = {
+            key
+            for interaction, _, parent in pairs
+            for key in (interaction, parent)
+        }
+        replicate = {
+            key: aggregate_year_stats(by_year, key[0], key[1], weights).metrics()
+            for key in required
+        }
+        for interaction, parent_kind, parent in pairs:
+            for metric in metrics:
+                samples[(interaction, parent_kind, parent, metric)].append(
+                    replicate[interaction][metric] - replicate[parent][metric]
+                )
+
+    rows: List[Dict[str, Any]] = []
+    for interaction, parent_kind, parent in pairs:
+        interaction_metrics = global_stats[interaction].metrics()
+        parent_metrics = global_stats[parent].metrics()
+        for metric in metrics:
+            values = np.asarray(samples[(interaction, parent_kind, parent, metric)], dtype=np.float64)
+            finite = values[np.isfinite(values)]
+            if finite.size:
+                low, high = np.percentile(finite, [2.5, 97.5])
+                lower_tail = (np.sum(finite <= 0.0) + 1.0) / (finite.size + 1.0)
+                upper_tail = (np.sum(finite >= 0.0) + 1.0) / (finite.size + 1.0)
+                p_value = min(1.0, 2.0 * min(lower_tail, upper_tail))
+            else:
+                low = high = p_value = float("nan")
+            rows.append({
+                "interaction_axis": interaction[0],
+                "interaction_stratum": interaction[1],
+                "parent_kind": parent_kind,
+                "parent_axis": parent[0],
+                "parent_stratum": parent[1],
+                "metric": metric,
+                "interaction_value": interaction_metrics[metric],
+                "parent_value": parent_metrics[metric],
+                "delta": interaction_metrics[metric] - parent_metrics[metric],
+                "delta_ci_low": float(low),
+                "delta_ci_high": float(high),
+                "p_value": float(p_value),
+                "p_holm_mjo": float("nan"),
+                "ci_excludes_zero": bool(low > 0.0 or high < 0.0),
+                "independent_year_blocks": int(years_array.size),
+                "bootstrap_reps": int(reps),
+            })
+
+    families: Dict[Tuple[str, str, str], Dict[int, float]] = defaultdict(dict)
+    for index, row in enumerate(rows):
+        if row["interaction_axis"].startswith("mjo_phase_x_"):
+            phase_match = re.fullmatch(r"phase_([1-8])__.+", str(row["interaction_stratum"]))
+            if phase_match is not None:
+                family = (str(row["interaction_axis"]), str(row["parent_kind"]), str(row["metric"]))
+                families[family][index] = float(row["p_value"])
+    for family in families.values():
+        adjusted = holm_adjust_pvalues(family)
+        for index, value in adjusted.items():
+            rows[index]["p_holm_mjo"] = value
+    return rows
+
+
 def confidence_selections(
     confidence: np.ndarray,
     percentiles: Sequence[int],
@@ -577,6 +704,10 @@ def stream_chunks(
                 low_sigma = (
                     np.asarray(arrays["model_sigma"])
                     <= float(np.asarray(boundaries["sigma_bottom_tercile_edge"]).item())
+                )
+                update_stratum(
+                    global_stats, by_year, "low_sigma", "bottom_sigma_tercile", year,
+                    probability, truth, base_rate, low_sigma,
                 )
                 for driver_axis, strata in driver_selections.items():
                     for stratum, driver_selection in strata.items():
@@ -769,6 +900,36 @@ def print_driver_verdicts(
         )
 
 
+def print_paired_interaction_headlines(rows: Sequence[Mapping[str, Any]]) -> None:
+    required = {
+        ("mjo_phase_x_top_confidence", "phase_8__top_10pct_ge_p90", "selection_parent"),
+        ("mjo_phase_x_top_confidence", "phase_8__top_10pct_ge_p90", "driver_parent"),
+        ("mjo_phase_x_low_sigma", "phase_8__bottom_sigma_tercile", "selection_parent"),
+        ("mjo_phase_x_low_sigma", "phase_8__bottom_sigma_tercile", "driver_parent"),
+    }
+    print("Paired phase-8 interaction tests (whole-year bootstrap):")
+    found = 0
+    for row in rows:
+        key = (
+            str(row["interaction_axis"]),
+            str(row["interaction_stratum"]),
+            str(row["parent_kind"]),
+        )
+        if key not in required or row["metric"] != "bss_unconditional":
+            continue
+        found += 1
+        holm = float(row["p_holm_mjo"])
+        holm_text = f"{holm:.4g}" if np.isfinite(holm) else "nan"
+        print(
+            f"  {row['interaction_stratum']} vs {row['parent_axis']}:{row['parent_stratum']}: "
+            f"delta_BSS={float(row['delta']):+.4f} "
+            f"CI=[{float(row['delta_ci_low']):+.4f},{float(row['delta_ci_high']):+.4f}] "
+            f"p={float(row['p_value']):.4g}, Holm-MJO={holm_text}"
+        )
+    if found != len(required):
+        print(f"  WARNING: found {found}/{len(required)} required phase-8 comparisons.")
+
+
 def run(args: argparse.Namespace) -> None:
     global _AUC_FROM_HIST
 
@@ -917,6 +1078,18 @@ def run(args: argparse.Namespace) -> None:
         if bootstrap_axes
         else {}
     )
+    paired_interaction_rows = (
+        paired_year_block_bootstrap_interactions(
+            global_stats,
+            by_year,
+            sorted(observed_years),
+            top_stratum,
+            reps=int(args.n_bootstrap),
+            seed=int(args.seed),
+        )
+        if driver_lookup is not None
+        else []
+    )
     summary_rows = build_summary_rows(global_stats, bootstrap, axis_bootstrap)
     by_year_rows = build_by_year_rows(by_year)
     write_csv(out_dir / "opportunity_summary.csv", summary_rows)
@@ -930,6 +1103,7 @@ def run(args: argparse.Namespace) -> None:
             if any(str(row["axis"]).startswith(axis) for axis in DRIVER_AXES)
         ]
         write_csv(out_dir / "driver_opportunity_summary.csv", driver_rows)
+        write_csv(out_dir / "driver_interaction_paired_bootstrap.csv", paired_interaction_rows)
         driver_conditional_bss_plot(driver_rows, out_dir / "driver_conditional_bss.png")
         print(
             "Slow-driver leakage audit: PASS (MJO/ENSO are external init-date indices; "
@@ -961,6 +1135,7 @@ def run(args: argparse.Namespace) -> None:
     )
     if driver_lookup is not None:
         print_driver_verdicts(global_stats, axis_bootstrap)
+        print_paired_interaction_headlines(paired_interaction_rows)
 
 
 def build_parser() -> argparse.ArgumentParser:

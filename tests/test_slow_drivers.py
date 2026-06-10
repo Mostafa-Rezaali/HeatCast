@@ -121,4 +121,5 @@ def test_driver_stream_uses_legacy_sidecar_and_builds_interactions(tmp_path: Pat
     assert global_stats[("mjo_phase", "phase_5")].count == 3
     assert global_stats[("enso_state", "el_nino")].count == 3
     assert global_stats[("soil_moisture_tercile", "dry")].count == 1
+    assert global_stats[("low_sigma", "bottom_sigma_tercile")].count == 1
     assert global_stats[("mjo_phase_x_low_sigma", "phase_5__bottom_sigma_tercile")].count == 1

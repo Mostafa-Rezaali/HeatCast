@@ -6,6 +6,8 @@ from forecasts_of_opportunity import (
     OpportunityStats,
     confidence_selections,
     fit_boundaries,
+    holm_adjust_pvalues,
+    paired_year_block_bootstrap_interactions,
     retained_percent_from_confidence_stratum,
     roc_auc_from_hist,
     stream_chunks,
@@ -85,6 +87,62 @@ def test_year_bootstrap_is_reproducible():
         [2000, 2001, 2002], reps=50, seed=42,
     )
     assert first == second
+
+
+def test_paired_interaction_bootstrap_compares_both_parents():
+    years = list(range(2000, 2008))
+    top_stratum = "top_10pct_ge_p90"
+    parent_keys = (
+        ("confidence", top_stratum),
+        ("low_sigma", "bottom_sigma_tercile"),
+        ("mjo_phase", "phase_8"),
+    )
+    interaction_keys = (
+        ("mjo_phase_x_top_confidence", f"phase_8__{top_stratum}"),
+        ("mjo_phase_x_low_sigma", "phase_8__bottom_sigma_tercile"),
+    )
+    global_stats = {}
+    by_year = {}
+    truth = np.array([0.0, 1.0] * 50)
+    base_rate = np.full(truth.shape, 0.5)
+    parent_probability = np.full(truth.shape, 0.5)
+    interaction_probability = np.where(truth > 0.5, 0.9, 0.1)
+    for key in parent_keys + interaction_keys:
+        global_stats[key] = OpportunityStats()
+    for year in years:
+        for key in parent_keys:
+            stats = OpportunityStats()
+            stats.update(parent_probability, truth, base_rate)
+            global_stats[key].add(stats)
+            by_year[(key[0], key[1], year)] = stats
+        for key in interaction_keys:
+            stats = OpportunityStats()
+            stats.update(interaction_probability, truth, base_rate)
+            global_stats[key].add(stats)
+            by_year[(key[0], key[1], year)] = stats
+    rows = paired_year_block_bootstrap_interactions(
+        global_stats, by_year, years, top_stratum, reps=100, seed=42
+    )
+    required = {
+        (axis, stratum, parent_kind)
+        for axis, stratum in interaction_keys
+        for parent_kind in ("selection_parent", "driver_parent")
+    }
+    unconditional = {
+        (row["interaction_axis"], row["interaction_stratum"], row["parent_kind"]): row
+        for row in rows
+        if row["metric"] == "bss_unconditional"
+    }
+    assert required == set(unconditional)
+    assert all(row["delta_ci_low"] > 0.0 for row in unconditional.values())
+    assert all(np.isfinite(row["p_holm_mjo"]) for row in unconditional.values())
+
+
+def test_holm_adjustment_is_step_down_and_never_smaller():
+    raw = {"a": 0.01, "b": 0.02, "c": 0.20}
+    adjusted = holm_adjust_pvalues(raw)
+    assert adjusted == {"a": 0.03, "b": 0.04, "c": 0.20}
+    assert all(adjusted[key] >= value for key, value in raw.items())
 
 
 def test_histogram_auc_matches_known_separation():
