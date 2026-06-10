@@ -25,8 +25,12 @@ def parse_rmm_file(path: Path) -> Dict[int, Tuple[int, float]]:
             continue
         try:
             year, month, day = (int(parts[0]), int(parts[1]), int(parts[2]))
-            phase = int(float(parts[-2]))
-            amplitude = float(parts[-1])
+            # BOM's documented columns are:
+            # year month day RMM1 RMM2 phase amplitude [optional source/method].
+            # Recent files append a method label after amplitude, so phase and
+            # amplitude must be read by position rather than from the line end.
+            phase = int(float(parts[5]))
+            amplitude = float(parts[6])
             key = int(f"{year:04d}{month:02d}{day:02d}")
         except ValueError:
             continue

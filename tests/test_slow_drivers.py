@@ -24,7 +24,7 @@ def test_fake_rmm_and_nino_parsers(tmp_path: Path):
     rmm_path = tmp_path / "rmm.txt"
     rmm_path.write_text(
         "year month day RMM1 RMM2 phase amplitude\n"
-        "2001 5 1 0.1 0.2 5 1.4\n"
+        "2001 5 1 0.1 0.2 5 1.4 Gottschalk10_method:_OLR_&_ACCESS_wind\n"
         "2001 5 2 0.1 0.2 2 0.7\n",
         encoding="utf-8",
     )
