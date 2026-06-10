@@ -3479,10 +3479,12 @@ def save_validation_plots(model, val_dataset, device, mask, epoch, save_dir, n_s
         truth_display = np.where(mask_np[:h, :w] > 0.5, plot_truth, np.nan)
 
         valid_mask = mask_np[:h, :w] > 0.5
-        p_v = pred[valid_mask]
-        t_v = truth[valid_mask]
+        p_v = plot_pred[valid_mask]
+        t_v = plot_truth[valid_mask]
         r2 = 1 - np.sum((t_v - p_v)**2) / (np.sum((t_v - t_v.mean())**2) + 1e-8)
-        corr = np.corrcoef(t_v, p_v)[0, 1] if t_v.std() > 1e-6 else 0.0
+        corr = 0.0
+        if t_v.std() > 1e-6 and p_v.std() > 1e-6:
+            corr = np.corrcoef(t_v, p_v)[0, 1]
         mae = np.mean(np.abs(t_v - p_v))
 
         fig, axes = plt.subplots(1, 3, figsize=(22, 6))
@@ -3491,7 +3493,7 @@ def save_validation_plots(model, val_dataset, device, mask, epoch, save_dir, n_s
         plt.colorbar(im, ax=axes[0], label=plot_label)
         im = axes[1].imshow(pred_display, cmap=plot_cmap, vmin=vmin, vmax=vmax, aspect='auto')
         title_mode = 'Tube center-day prediction' if Config.MULTI_LEAD_TUBE else 'Direct 15-day Prediction'
-        axes[1].set_title(f'{title_mode}\nMAE={mae:.3f}, r={corr:.3f}, R2={r2:.3f}',
+        axes[1].set_title(f'{title_mode}\nMAE={mae:.3f}, anom_r={corr:.3f}, anom_R2={r2:.3f}',
                           fontsize=13, fontweight='bold')
         plt.colorbar(im, ax=axes[1], label=plot_label)
         diff_display = np.where(mask_np[:h, :w] > 0.5, plot_pred - plot_truth, np.nan)
