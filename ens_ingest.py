@@ -103,6 +103,13 @@ def _coordinate_name(data_array, candidates: Iterable[str]) -> str:
     raise RuntimeError(f"Could not find any of coordinates/dimensions {tuple(candidates)} in {data_array.dims}.")
 
 
+def _optional_coordinate_name(data_array, candidates: Iterable[str]) -> str | None:
+    for name in candidates:
+        if name in data_array.coords or name in data_array.dims:
+            return name
+    return None
+
+
 def _lead_days(values: np.ndarray, units: str = "") -> np.ndarray:
     values = np.asarray(values)
     if np.issubdtype(values.dtype, np.timedelta64):
@@ -113,6 +120,49 @@ def _lead_days(values: np.ndarray, units: str = "") -> np.ndarray:
     if "hour" in unit_text or np.nanmax(numeric) > 100:
         return np.ceil(numeric / 24.0).astype(np.int16)
     return np.ceil(numeric).astype(np.int16)
+
+
+def _native_group_components(
+    dataset,
+    variable: str,
+    default_member: int | None = None,
+) -> Tuple[np.ndarray, np.ndarray, str, np.ndarray, np.ndarray, np.ndarray]:
+    if variable not in dataset:
+        raise RuntimeError(f"Missing variable {variable!r}; available={list(dataset.data_vars)}")
+    data = dataset[variable].squeeze(drop=True)
+    member_dim = _optional_coordinate_name(data, ("number", "member", "realization", "ensemble"))
+    lead_dim = _coordinate_name(data, ("step", "lead", "leadtime", "forecast_period", "time"))
+    lat_dim = _coordinate_name(data, ("latitude", "lat"))
+    lon_dim = _coordinate_name(data, ("longitude", "lon"))
+    if member_dim is None:
+        if default_member is None:
+            raise RuntimeError(f"Could not find an ensemble-member dimension in {data.dims}.")
+        member_dim = "number"
+        data = data.expand_dims({member_dim: [int(default_member)]})
+    data = data.transpose(member_dim, lead_dim, lat_dim, lon_dim)
+    return (
+        np.asarray(data.values, dtype=np.float32),
+        np.asarray(data[lead_dim].values),
+        str(data[lead_dim].attrs.get("units", "")),
+        np.asarray(data[lat_dim].values, dtype=np.float32),
+        np.asarray(data[lon_dim].values, dtype=np.float32),
+        np.asarray(data[member_dim].values),
+    )
+
+
+def _validate_matching_group(
+    path: Path,
+    reference: Tuple[np.ndarray, np.ndarray, str, np.ndarray, np.ndarray, np.ndarray],
+    candidate: Tuple[np.ndarray, np.ndarray, str, np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    ref_raw, ref_lead, ref_units, ref_lat, ref_lon, _ = reference
+    raw, lead, units, lat, lon, _ = candidate
+    if raw.shape[1:] != ref_raw.shape[1:]:
+        raise RuntimeError(f"{path}: control/perturbed GRIB shapes differ: {ref_raw.shape} vs {raw.shape}.")
+    if not np.array_equal(_lead_days(lead, units), _lead_days(ref_lead, ref_units)):
+        raise RuntimeError(f"{path}: control/perturbed GRIB lead coordinates differ.")
+    if not np.allclose(lat, ref_lat) or not np.allclose(lon, ref_lon):
+        raise RuntimeError(f"{path}: control/perturbed GRIB latitude/longitude coordinates differ.")
 
 
 def load_native_daily_max(
@@ -126,24 +176,42 @@ def load_native_daily_max(
     except ImportError as exc:
         raise RuntimeError("ens_ingest.py requires xarray; GRIB files additionally require cfgrib.") from exc
     engine = "cfgrib" if path.suffix.lower() in {".grib", ".grib2", ".grb", ".grb2"} else None
-    dataset = xr.open_dataset(path, engine=engine)
+    datasets = []
     try:
-        if variable not in dataset:
-            raise RuntimeError(f"{path}: missing variable {variable!r}; available={list(dataset.data_vars)}")
-        data = dataset[variable].squeeze(drop=True)
-        member_dim = _coordinate_name(data, ("number", "member", "realization", "ensemble"))
-        lead_dim = _coordinate_name(data, ("step", "lead", "leadtime", "forecast_period", "time"))
-        lat_dim = _coordinate_name(data, ("latitude", "lat"))
-        lon_dim = _coordinate_name(data, ("longitude", "lon"))
-        data = data.transpose(member_dim, lead_dim, lat_dim, lon_dim)
-        member_values = np.asarray(data[member_dim].values)
+        if engine == "cfgrib":
+            groups = []
+            for data_type, default_member in (("cf", 0), ("pf", None)):
+                dataset = xr.open_dataset(
+                    path,
+                    engine=engine,
+                    backend_kwargs={
+                        "filter_by_keys": {"dataType": data_type},
+                        "indexpath": "",
+                    },
+                )
+                datasets.append(dataset)
+                try:
+                    groups.append(_native_group_components(dataset, variable, default_member))
+                except RuntimeError as exc:
+                    raise RuntimeError(f"{path} dataType={data_type}: {exc}") from exc
+            _validate_matching_group(path, groups[0], groups[1])
+            raw = np.concatenate([group[0] for group in groups], axis=0)
+            member_values = np.concatenate([group[5] for group in groups])
+            lead_values, lead_units, source_lat, source_lon = groups[0][1:5]
+        else:
+            dataset = xr.open_dataset(path, engine=engine)
+            datasets.append(dataset)
+            raw, lead_values, lead_units, source_lat, source_lon, member_values = _native_group_components(
+                dataset,
+                variable,
+            )
         if member_values.size != int(expected_members):
             raise RuntimeError(
                 f"{path}: expected {expected_members} members, found {member_values.size}."
             )
-        lead_values = np.asarray(data[lead_dim].values)
-        lead_days = _lead_days(lead_values, str(data[lead_dim].attrs.get("units", "")))
-        raw = np.asarray(data.values, dtype=np.float32)
+        if np.unique(member_values).size != member_values.size:
+            raise RuntimeError(f"{path}: duplicate ensemble member labels: {member_values.tolist()}.")
+        lead_days = _lead_days(lead_values, lead_units)
         daily = np.full((raw.shape[0], int(max_lead), raw.shape[2], raw.shape[3]), np.nan, dtype=np.float32)
         for lead in range(1, int(max_lead) + 1):
             indices = np.where(lead_days == lead)[0]
@@ -153,12 +221,13 @@ def load_native_daily_max(
                 daily[:, lead - 1] = np.nanmax(raw[:, indices], axis=1)
         return (
             daily,
-            np.asarray(data[lat_dim].values, dtype=np.float32),
-            np.asarray(data[lon_dim].values, dtype=np.float32),
+            source_lat,
+            source_lon,
             member_values,
         )
     finally:
-        dataset.close()
+        for dataset in datasets:
+            dataset.close()
 
 
 def main() -> None:

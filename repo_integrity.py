@@ -71,6 +71,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
 
     cfm = _text(root, "cfm_mesh_train.py")
     exceed = _text(root, "exceedance_eval.py")
+    ens_ingest = _text(root, "ens_ingest.py")
     mode = _text(root, "mode_dispatch.py")
     mesh = _text(root, "mesh_backbone.py")
     w34_train = _text(root, "submit_w34_tube_all.slurm")
@@ -200,6 +201,18 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "--bootstrap_reps 5000",
             '"$PY" repo_integrity.py',
         ),
+    ))
+
+    results.append(_result(
+        "s2s.mixed_control_perturbed_grib_contract",
+        all(token in ens_ingest for token in (
+            'for data_type, default_member in (("cf", 0), ("pf", None)):',
+            '"filter_by_keys": {"dataType": data_type}',
+            '"indexpath": ""',
+            "raw = np.concatenate([group[0] for group in groups], axis=0)",
+            "member_values = np.concatenate([group[5] for group in groups])",
+        )),
+        "ENS ingestion opens and combines control and perturbed GRIB groups explicitly",
     ))
 
     for relative in (

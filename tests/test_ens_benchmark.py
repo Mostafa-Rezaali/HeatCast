@@ -1,4 +1,6 @@
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -10,7 +12,7 @@ from ens_common import (
     member_fraction_probability,
 )
 from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu, retrieve
-from ens_ingest import load_init_list
+from ens_ingest import load_init_list, load_native_daily_max
 from stitch_exceedance_folds import load_fold_inputs
 
 
@@ -128,3 +130,81 @@ def test_s2s_retrieve_uses_current_ecds_dataset(tmp_path: Path):
     assert request["step"] == ["6", "12", "18", "24"]
     assert "dataset" not in request and "target" not in request
     assert target.endswith("out.grib")
+
+
+def test_ingest_opens_and_combines_control_and_perturbed_grib_groups(monkeypatch, tmp_path: Path):
+    calls = []
+    steps = np.array([6, 12, 18, 24], dtype="timedelta64[h]")
+    lat = np.array([25.0, 26.5], dtype=np.float32)
+    lon = np.array([235.0, 236.5], dtype=np.float32)
+
+    class FakeDataArray:
+        def __init__(self, values, dims, coords):
+            self.values = np.asarray(values)
+            self.dims = tuple(dims)
+            self.coords = {name: np.asarray(value) for name, value in coords.items()}
+
+        def squeeze(self, drop=True):
+            return self
+
+        def expand_dims(self, dimensions):
+            name, values = next(iter(dimensions.items()))
+            coords = dict(self.coords)
+            coords[name] = np.asarray(values)
+            return FakeDataArray(self.values[None, ...], (name, *self.dims), coords)
+
+        def transpose(self, *dims):
+            order = [self.dims.index(name) for name in dims]
+            return FakeDataArray(np.transpose(self.values, order), dims, self.coords)
+
+        def __getitem__(self, name):
+            return SimpleNamespace(values=self.coords[name], attrs={})
+
+    class FakeDataset:
+        def __init__(self, data):
+            self.data = data
+            self.data_vars = {"mx2t6": data}
+
+        def __contains__(self, name):
+            return name in self.data_vars
+
+        def __getitem__(self, name):
+            return self.data_vars[name]
+
+        def close(self):
+            pass
+
+    def fake_open_dataset(path, engine=None, backend_kwargs=None):
+        data_type = backend_kwargs["filter_by_keys"]["dataType"]
+        calls.append((engine, data_type, backend_kwargs["indexpath"]))
+        if data_type == "cf":
+            values = np.arange(16, dtype=np.float32).reshape(4, 2, 2)
+            return FakeDataset(
+                FakeDataArray(
+                    values,
+                    ("step", "latitude", "longitude"),
+                    {"step": steps, "latitude": lat, "longitude": lon},
+                )
+            )
+        values = 100 + np.arange(32, dtype=np.float32).reshape(2, 4, 2, 2)
+        return FakeDataset(
+            FakeDataArray(
+                values,
+                ("number", "step", "latitude", "longitude"),
+                {"number": [1, 2], "step": steps, "latitude": lat, "longitude": lon},
+            )
+        )
+
+    monkeypatch.setitem(sys.modules, "xarray", SimpleNamespace(open_dataset=fake_open_dataset))
+    daily, source_lat, source_lon, members = load_native_daily_max(
+        tmp_path / "mixed.grib",
+        "mx2t6",
+        max_lead=1,
+        expected_members=3,
+    )
+    assert calls == [("cfgrib", "cf", ""), ("cfgrib", "pf", "")]
+    assert daily.shape == (3, 1, 2, 2)
+    assert np.array_equal(members, np.array([0, 1, 2]))
+    assert np.array_equal(source_lat, lat)
+    assert np.array_equal(source_lon, lon)
+    assert np.array_equal(daily[:, 0, 0, 0], np.array([12.0, 112.0, 128.0], dtype=np.float32))
