@@ -110,6 +110,13 @@ def _optional_coordinate_name(data_array, candidates: Iterable[str]) -> str | No
     return None
 
 
+def _optional_dimension_name(data_array, candidates: Iterable[str]) -> str | None:
+    for name in candidates:
+        if name in data_array.dims:
+            return name
+    return None
+
+
 def _lead_days(values: np.ndarray, units: str = "") -> np.ndarray:
     values = np.asarray(values)
     if np.issubdtype(values.dtype, np.timedelta64):
@@ -130,15 +137,26 @@ def _native_group_components(
     if variable not in dataset:
         raise RuntimeError(f"Missing variable {variable!r}; available={list(dataset.data_vars)}")
     data = dataset[variable].squeeze(drop=True)
-    member_dim = _optional_coordinate_name(data, ("number", "member", "realization", "ensemble"))
+    member_candidates = ("number", "member", "realization", "ensemble")
+    member_dim = _optional_dimension_name(data, member_candidates)
     lead_dim = _coordinate_name(data, ("step", "lead", "leadtime", "forecast_period", "time"))
     lat_dim = _coordinate_name(data, ("latitude", "lat"))
     lon_dim = _coordinate_name(data, ("longitude", "lon"))
     if member_dim is None:
-        if default_member is None:
+        scalar_member = _optional_coordinate_name(data, member_candidates)
+        if scalar_member is not None:
+            values = np.asarray(data[scalar_member].values).reshape(-1)
+            if values.size != 1:
+                raise RuntimeError(
+                    f"Member coordinate {scalar_member!r} is not a dimension and has {values.size} values."
+                )
+            member_dim = scalar_member
+            data = data.expand_dims(member_dim)
+        elif default_member is None:
             raise RuntimeError(f"Could not find an ensemble-member dimension in {data.dims}.")
-        member_dim = "number"
-        data = data.expand_dims({member_dim: [int(default_member)]})
+        else:
+            member_dim = "number"
+            data = data.expand_dims({member_dim: [int(default_member)]})
     data = data.transpose(member_dim, lead_dim, lat_dim, lon_dim)
     return (
         np.asarray(data.values, dtype=np.float32),
@@ -146,7 +164,7 @@ def _native_group_components(
         str(data[lead_dim].attrs.get("units", "")),
         np.asarray(data[lat_dim].values, dtype=np.float32),
         np.asarray(data[lon_dim].values, dtype=np.float32),
-        np.asarray(data[member_dim].values),
+        np.asarray(data[member_dim].values).reshape(-1),
     )
 
 

@@ -148,6 +148,10 @@ def test_ingest_opens_and_combines_control_and_perturbed_grib_groups(monkeypatch
             return self
 
         def expand_dims(self, dimensions):
+            if isinstance(dimensions, str):
+                name = dimensions
+                values = np.asarray(self.coords[name]).reshape(-1)
+                return FakeDataArray(self.values[None, ...], (name, *self.dims), self.coords)
             name, values = next(iter(dimensions.items()))
             coords = dict(self.coords)
             coords[name] = np.asarray(values)
@@ -183,7 +187,7 @@ def test_ingest_opens_and_combines_control_and_perturbed_grib_groups(monkeypatch
                 FakeDataArray(
                     values,
                     ("step", "latitude", "longitude"),
-                    {"step": steps, "latitude": lat, "longitude": lon},
+                    {"number": np.array(0), "step": steps, "latitude": lat, "longitude": lon},
                 )
             )
         values = 100 + np.arange(32, dtype=np.float32).reshape(2, 4, 2, 2)
