@@ -21,6 +21,8 @@ cd "$WORK_DIR"
 module load cuda/12.9.1
 unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 
 git pull --ff-only origin codex/tube_v1
 "$PY" -m py_compile repo_integrity.py ens_common.py ens_ingest.py
@@ -32,4 +34,5 @@ git pull --ff-only origin codex/tube_v1
   --variable mx2t6 \
   --weekdays 0,3 \
   --max_lead 28 \
-  --expected_members 11
+  --expected_members 11 \
+  --workers 8

@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
+import multiprocessing
+import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -15,6 +18,9 @@ from publication_analysis_utils import conus_lat_lon
 
 
 BASE_DATE = datetime(1981, 5, 1)
+_WORKER_LAND_MASK = None
+_WORKER_TARGET_LAT = None
+_WORKER_TARGET_LON = None
 
 
 def parse_int_list(text: str) -> Tuple[int, ...]:
@@ -248,6 +254,80 @@ def load_native_daily_max(
             dataset.close()
 
 
+def _initialize_ingest_worker(
+    land_mask: np.ndarray,
+    target_lat: np.ndarray,
+    target_lon: np.ndarray,
+) -> None:
+    global _WORKER_LAND_MASK, _WORKER_TARGET_LAT, _WORKER_TARGET_LON
+    _WORKER_LAND_MASK = np.asarray(land_mask, dtype=bool)
+    _WORKER_TARGET_LAT = np.asarray(target_lat)
+    _WORKER_TARGET_LON = np.asarray(target_lon)
+
+
+def _write_ingested_output(
+    output_path: Path,
+    regridded: np.ndarray,
+    max_lead: int,
+    members: np.ndarray,
+    label: str,
+    init_time_index: int,
+    variable: str,
+) -> None:
+    temporary_path = output_path.with_suffix(output_path.suffix + f".tmp.{os.getpid()}")
+    try:
+        with temporary_path.open("wb") as output:
+            np.savez_compressed(
+                output,
+                t2max=np.asarray(regridded, dtype=np.float32),
+                leads=np.arange(1, int(max_lead) + 1, dtype=np.int16),
+                members=np.asarray(members),
+                init_date=np.array(label),
+                init_time_index=np.array(init_time_index, dtype=np.int32),
+                variable=np.array(str(variable)),
+            )
+        os.replace(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def ingest_one_init(
+    label: str,
+    raw_path: str,
+    output_path: str,
+    variable: str,
+    max_lead: int,
+    expected_members: int,
+    init_time_index: int,
+) -> str:
+    if _WORKER_LAND_MASK is None or _WORKER_TARGET_LAT is None or _WORKER_TARGET_LON is None:
+        raise RuntimeError("ENS ingest worker was not initialized.")
+    native, source_lat, source_lon, members = load_native_daily_max(
+        Path(raw_path),
+        variable,
+        max_lead,
+        expected_members,
+    )
+    regridded = bilinear_regrid_regular(
+        native,
+        source_lat,
+        source_lon,
+        _WORKER_TARGET_LAT,
+        _WORKER_TARGET_LON,
+    )
+    regridded[:, :, ~_WORKER_LAND_MASK] = np.nan
+    _write_ingested_output(
+        Path(output_path),
+        regridded,
+        max_lead,
+        members,
+        label,
+        init_time_index,
+        variable,
+    )
+    return label
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw_dir", default="/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/raw")
@@ -260,12 +340,20 @@ def main() -> None:
     parser.add_argument("--max_lead", type=int, default=28)
     parser.add_argument("--expected_members", type=int, default=11)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Independent initialization files to ingest concurrently.",
+    )
+    parser.add_argument(
         "--init_list",
         default=None,
         help="Optional YYYYMMDD list from download_ecmwf_s2s.py; uses only available S2S inits.",
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1.")
 
     print(ENS_BENCHMARK_BANNER)
     raw_dir = Path(args.raw_dir)
@@ -302,35 +390,64 @@ def main() -> None:
         )
 
     _, _, target_lat, target_lon = conus_lat_lon((621, 1405))
-    completed = 0
+    tasks = []
+    skipped = 0
     for label in init_labels:
         output_path = output_dir / f"init_{label}.npz"
         if output_path.exists() and not args.overwrite:
+            skipped += 1
             continue
-        native, source_lat, source_lon, members = load_native_daily_max(
-            raw_files[label],
-            args.variable,
-            args.max_lead,
-            args.expected_members,
-        )
-        regridded = bilinear_regrid_regular(native, source_lat, source_lon, target_lat, target_lon)
         init_time_index = date_lookup.get(label)
         if init_time_index is None:
             print(f"Skipping init {label}: date is outside the HeatCast MJJAS time axis.")
             continue
-        regridded[:, :, ~land_mask] = np.nan
-        np.savez_compressed(
-            output_path,
-            t2max=regridded.astype(np.float32),
-            leads=np.arange(1, int(args.max_lead) + 1, dtype=np.int16),
-            members=np.asarray(members),
-            init_date=np.array(label),
-            init_time_index=np.array(init_time_index, dtype=np.int32),
-            variable=np.array(str(args.variable)),
-        )
-        completed += 1
-        if completed % 25 == 0:
-            print(f"  regridded {completed}/{len(init_labels)} initialization files")
+        tasks.append((
+            label,
+            str(raw_files[label]),
+            str(output_path),
+            str(args.variable),
+            int(args.max_lead),
+            int(args.expected_members),
+            int(init_time_index),
+        ))
+
+    print(
+        f"ENS ingestion plan: total={len(init_labels)}, skipped_existing={skipped}, "
+        f"remaining={len(tasks)}, workers={args.workers}"
+    )
+    if not tasks:
+        print(f"ENS ingestion complete: all requested files already exist in {output_dir}")
+        return
+
+    completed = 0
+    if args.workers == 1:
+        _initialize_ingest_worker(land_mask, target_lat, target_lon)
+        for task in tasks:
+            ingest_one_init(*task)
+            completed += 1
+            if completed % 10 == 0 or completed == len(tasks):
+                print(f"  regridded {completed}/{len(tasks)} remaining initialization files")
+    else:
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=int(args.workers),
+            mp_context=context,
+            initializer=_initialize_ingest_worker,
+            initargs=(land_mask, target_lat, target_lon),
+        ) as executor:
+            futures = {
+                executor.submit(ingest_one_init, *task): task[0]
+                for task in tasks
+            }
+            for future in as_completed(futures):
+                label = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"ENS ingestion failed for init {label}.") from exc
+                completed += 1
+                if completed % 10 == 0 or completed == len(tasks):
+                    print(f"  regridded {completed}/{len(tasks)} remaining initialization files")
     print(f"ENS ingestion complete: wrote {completed} files to {output_dir}")
 
 

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+import ens_ingest as ingest
 from ens_common import (
     apply_quantile_mapping,
     common_init_indices,
@@ -212,3 +213,39 @@ def test_ingest_opens_and_combines_control_and_perturbed_grib_groups(monkeypatch
     assert np.array_equal(source_lat, lat)
     assert np.array_equal(source_lon, lon)
     assert np.array_equal(daily[:, 0, 0, 0], np.array([12.0, 112.0, 128.0], dtype=np.float32))
+
+
+def test_ingest_worker_writes_atomic_resume_safe_output(monkeypatch, tmp_path: Path):
+    land_mask = np.array([[True, False], [True, True]])
+    target_lat = np.array([[25.0, 25.0], [26.0, 26.0]], dtype=np.float32)
+    target_lon = np.array([[-100.0, -99.0], [-100.0, -99.0]], dtype=np.float32)
+    native = np.arange(12, dtype=np.float32).reshape(1, 3, 2, 2)
+
+    monkeypatch.setattr(
+        ingest,
+        "load_native_daily_max",
+        lambda *args: (native, target_lat[:, 0], target_lon[0], np.array([0])),
+    )
+    monkeypatch.setattr(
+        ingest,
+        "bilinear_regrid_regular",
+        lambda values, *args: values.copy(),
+    )
+    ingest._initialize_ingest_worker(land_mask, target_lat, target_lon)
+    output_path = tmp_path / "init_20010701.npz"
+    assert ingest.ingest_one_init(
+        "20010701",
+        str(tmp_path / "raw.grib"),
+        str(output_path),
+        "mx2t6",
+        3,
+        1,
+        123,
+    ) == "20010701"
+    assert output_path.exists()
+    assert not list(tmp_path.glob("*.tmp.*"))
+    with np.load(output_path) as saved:
+        assert saved["t2max"].shape == (1, 3, 2, 2)
+        assert np.all(np.isnan(saved["t2max"][:, :, 0, 1]))
+        assert saved["init_time_index"].item() == 123
+        assert saved["init_date"].item() == "20010701"

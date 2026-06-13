@@ -218,6 +218,25 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "ENS ingestion opens and combines control and perturbed GRIB groups explicitly",
     ))
 
+    ens_ingest_submission = _text(root, "submit_ens_ingest.slurm")
+    results.append(_result(
+        "s2s.parallel_ingest_contract",
+        all(token in ens_ingest for token in (
+            "ProcessPoolExecutor",
+            "multiprocessing.get_context(\"spawn\")",
+            "def ingest_one_init(",
+            "def _write_ingested_output(",
+            "os.replace(temporary_path, output_path)",
+        ))
+        and all(token in ens_ingest_submission for token in (
+            "--cpus-per-task=32",
+            "--workers 8",
+            "export OMP_NUM_THREADS=1",
+            "export MKL_NUM_THREADS=1",
+        )),
+        "ENS ingestion uses bounded process parallelism and atomic resume-safe outputs",
+    ))
+
     for relative in (
         "submit_w34_tube_all.slurm",
         "submit_w34_eval_stitch.slurm",
