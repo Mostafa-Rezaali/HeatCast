@@ -246,6 +246,17 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "ENS ingestion uses bounded process parallelism and atomic resume-safe outputs",
     ))
 
+    download_s2s = _text(root, "download_ecmwf_s2s.py")
+    results.append(_result(
+        "s2s.parallel_download_contract",
+        "ThreadPoolExecutor(max_workers=int(args.workers))" in download_s2s
+        and '"--workers"' in download_s2s
+        and 'target.with_suffix(target.suffix + ".part")' in download_s2s
+        and "partial.replace(target)" in download_s2s
+        and "valid_grib(partial)" in download_s2s,
+        "ENS downloading uses bounded parallel requests with validated atomic outputs",
+    ))
+
     results.append(_result(
         "s2s.score_extended_global_contract",
         "def configure_fold(" in ens_score

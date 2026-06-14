@@ -401,6 +401,17 @@ def test_cycle_widen_submission_rescores_legacy_and_merges_by_year():
     assert "--emit_per_year" in script
 
 
+def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():
+    source = (Path(__file__).resolve().parents[1] / "download_ecmwf_s2s.py").read_text(
+        encoding="utf-8"
+    )
+    assert "ThreadPoolExecutor(max_workers=int(args.workers))" in source
+    assert 'parser.add_argument(' in source and '"--workers"' in source
+    assert 'partial = target.with_suffix(target.suffix + ".part")' in source
+    assert "partial.replace(target)" in source
+    assert "if not valid_grib(partial):" in source
+
+
 def test_ens_score_lightweight_loader_uses_only_disk_heat_and_time_cache(tmp_path: Path):
     cache_dir = tmp_path / "data_cache"
     cache_dir.mkdir()

@@ -21,9 +21,10 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, Tuple
 
 
 def mjjas_mon_thu(year: int) -> Iterable[date]:
@@ -63,6 +64,51 @@ def retrieve(
     if kind == "pf":
         request["number"] = [str(number) for number in range(1, 11)]
     client.retrieve("s2s-reforecasts", request, str(target))
+
+
+def valid_grib(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    return subprocess.run(
+        ["grib_count", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+
+def retrieve_task(
+    task: Tuple[int, date, Tuple[date, ...], str, Path],
+    area: str,
+    max_step_hours: int,
+) -> str:
+    rt_year, model_date, hdates, kind, target = task
+    if valid_grib(target):
+        return f"exists, skipping: rt{rt_year}/{target.name}"
+    if target.exists():
+        target.unlink()
+    partial = target.with_suffix(target.suffix + ".part")
+    partial.unlink(missing_ok=True)
+    print(f"  retrieving rt{rt_year}/{target.name} ({len(hdates)} hdates)...", flush=True)
+    try:
+        import cdsapi
+
+        retrieve(
+            cdsapi.Client(),
+            model_date,
+            hdates,
+            kind,
+            partial,
+            area,
+            max_step_hours,
+        )
+        if not valid_grib(partial):
+            raise RuntimeError(f"Downloaded file failed GRIB validation: {partial}")
+        partial.replace(target)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return f"retrieved: rt{rt_year}/{target.name}"
 
 
 def split_by_hdate(grib_path: Path, out_dir: Path) -> None:
@@ -130,6 +176,12 @@ def main() -> None:
     )
     parser.add_argument("--hindcast_years", type=int, default=20)
     parser.add_argument("--max_lead_days", type=int, default=28)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Concurrent ECMWF retrieval requests. Use 2-4 to avoid excessive API pressure.",
+    )
     parser.add_argument("--area", default="50/-125/24/-66", help="CONUS box N/W/S/E.")
     parser.add_argument(
         "--skip_download",
@@ -141,8 +193,9 @@ def main() -> None:
     raw_dir = Path(args.raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
     rt_years = (int(args.rt_year),) if args.rt_year is not None else parse_year_list(args.rt_years)
+    if int(args.workers) < 1:
+        raise ValueError("--workers must be at least 1.")
     max_step_hours = int(args.max_lead_days) * 24
-    client = None
     if not args.skip_download:
         try:
             import cdsapi
@@ -150,7 +203,6 @@ def main() -> None:
             raise RuntimeError(
                 "Missing cdsapi>=0.7.7. Install it and configure ~/.cdsapirc for ECDS."
             ) from exc
-        client = cdsapi.Client()
 
     combined_path = raw_dir / "init_list.txt"
     combined_labels = {
@@ -166,18 +218,23 @@ def main() -> None:
         model_dates = list(mjjas_mon_thu(rt_year))
         print(
             f"{len(model_dates)} model dates (MJJAS Mon/Thu {rt_year}), "
-            f"{args.hindcast_years} hindcast years each, steps 6..{max_step_hours}h."
+            f"{args.hindcast_years} hindcast years each, steps 6..{max_step_hours}h, "
+            f"workers={args.workers}."
         )
-        for model_date in model_dates:
-            if not args.skip_download:
+        if not args.skip_download:
+            tasks = []
+            for model_date in model_dates:
                 hdates = hindcast_dates(model_date, args.hindcast_years)
                 for kind in ("cf", "pf"):
                     target = downloads / f"model_{model_date.strftime('%Y%m%d')}_{kind}.grib"
-                    if target.exists() and target.stat().st_size > 0:
-                        print(f"  exists, skipping: rt{rt_year}/{target.name}")
-                        continue
-                    print(f"  retrieving rt{rt_year}/{target.name} ({len(hdates)} hdates)...")
-                    retrieve(client, model_date, hdates, kind, target, args.area, max_step_hours)
+                    tasks.append((rt_year, model_date, tuple(hdates), kind, target))
+            with ThreadPoolExecutor(max_workers=int(args.workers)) as executor:
+                futures = [
+                    executor.submit(retrieve_task, task, args.area, max_step_hours)
+                    for task in tasks
+                ]
+                for future in as_completed(futures):
+                    print(f"  {future.result()}", flush=True)
         labels = assemble_by_hdate(downloads, parts, raw_dir, rt_year)
         combined_labels.update(labels)
         print(f"Completed rt{rt_year}: {len(labels)} tagged init files.")
