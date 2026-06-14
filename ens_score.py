@@ -207,6 +207,11 @@ def build_or_load_quantile_mapping(
 
         for month in required_months[int(lead)]:
             path = mapping_path(cache_dir, month, int(lead))
+            pairs = grouped.get(month, [])
+            mapping_init_indices = np.array(
+                sorted(int(init_t) for init_t, _ in pairs),
+                dtype=np.int32,
+            )
             if path.exists():
                 with np.load(path, allow_pickle=False) as data:
                     if (
@@ -217,6 +222,11 @@ def build_or_load_quantile_mapping(
                         and (
                             str(np.asarray(data["rt_tag"]).item()) if "rt_tag" in data.files else ""
                         ) == rt_tag
+                        and "mapping_init_indices" in data.files
+                        and np.array_equal(
+                            np.atleast_1d(data["mapping_init_indices"]).astype(np.int32),
+                            mapping_init_indices,
+                        )
                         and np.asarray(data["source_quantiles"]).shape == (int(quantile_count), land_count)
                         and np.asarray(data["target_quantiles"]).shape == (int(quantile_count), land_count)
                     ):
@@ -226,7 +236,6 @@ def build_or_load_quantile_mapping(
                         )
                         sanity_errors.append(float(np.asarray(data["train_mean_mae"]).item()))
                         continue
-            pairs = grouped.get(month, [])
             if not pairs:
                 raise RuntimeError(
                     f"No train-year ENS inits available for required target month={month}, lead={lead}. "
@@ -271,6 +280,7 @@ def build_or_load_quantile_mapping(
                 lead=np.array(int(lead), dtype=np.int16),
                 land_count=np.array(land_count, dtype=np.int32),
                 rt_tag=np.array(rt_tag),
+                mapping_init_indices=mapping_init_indices,
             )
             mappings[(month, int(lead))] = (source_q, target_q)
             sanity_errors.append(train_mean_mae)

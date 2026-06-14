@@ -272,6 +272,15 @@ def audit_repository(root: Path) -> list[CheckResult]:
     ))
 
     results.append(_result(
+        "s2s.score_qmap_init_fingerprint_contract",
+        "mapping_init_indices=mapping_init_indices" in ens_score
+        and '"mapping_init_indices" in data.files' in ens_score
+        and 'data["mapping_init_indices"]' in ens_score
+        and "np.array_equal(" in ens_score,
+        "ENS quantile-mapping caches are invalidated when the exact training initialization set changes",
+    ))
+
+    results.append(_result(
         "s2s.score_lightweight_cache_contract",
         "def load_ens_scoring_shared_data(" in ens_score
         and '"heat_index": cache_dir / "heat_index.npy"' in ens_score

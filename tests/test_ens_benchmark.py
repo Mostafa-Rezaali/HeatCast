@@ -333,6 +333,14 @@ def test_ens_quantile_mapping_requires_only_observed_valid_target_months():
     assert 5 not in required[28]
 
 
+def test_ens_quantile_mapping_cache_is_keyed_by_exact_training_init_set():
+    source = (Path(__file__).resolve().parents[1] / "ens_score.py").read_text(encoding="utf-8")
+    assert 'mapping_init_indices=mapping_init_indices' in source
+    assert '"mapping_init_indices" in data.files' in source
+    assert 'np.array_equal(' in source
+    assert 'data["mapping_init_indices"]' in source
+
+
 def test_ens_score_submission_runs_bounded_parallel_folds_before_compare():
     script = (Path(__file__).resolve().parents[1] / "submit_ens_score_compare.slurm").read_text(
         encoding="utf-8"
