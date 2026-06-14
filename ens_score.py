@@ -20,7 +20,7 @@ from ens_common import (
     fit_quantile_mapping,
     member_fraction_probability,
 )
-from ens_ingest import validate_ingested_output
+from ens_ingest import normalize_rt_tag, validate_ingested_output
 
 
 def configure_fold(fold: int, window_leads: Sequence[int], cv_stride: int) -> None:
@@ -136,9 +136,10 @@ def load_ens_members(path: Path, window_leads: Sequence[int]) -> Dict[int, np.nd
     return {int(lead): values[:, leads.index(int(lead))] for lead in window_leads}
 
 
-def quantile_cache_dir(cache_root: Path, window_leads: Sequence[int]) -> Path:
+def quantile_cache_dir(cache_root: Path, window_leads: Sequence[int], rt_tag: str = "") -> Path:
     return (
         cache_root
+        / (normalize_rt_tag(rt_tag) or "legacy")
         / f"fold{int(cfm.Config.CV_FOLD)}"
         / f"window_{ee.lead_list_label(window_leads)}"
     )
@@ -176,8 +177,10 @@ def build_or_load_quantile_mapping(
     window_leads: Sequence[int],
     cache_root: Path,
     quantile_count: int,
+    rt_tag: str = "",
 ) -> Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]]:
-    cache_dir = quantile_cache_dir(cache_root, window_leads)
+    rt_tag = normalize_rt_tag(rt_tag)
+    cache_dir = quantile_cache_dir(cache_root, window_leads, rt_tag)
     cache_dir.mkdir(parents=True, exist_ok=True)
     months, years, _ = ee.month_doy_year_arrays(shared_data["time_values"])
     heat = shared_data["heat_index"]
@@ -211,6 +214,9 @@ def build_or_load_quantile_mapping(
                         and tuple(np.atleast_1d(data["window_leads"]).astype(int).tolist())
                         == tuple(int(value) for value in window_leads)
                         and set(np.atleast_1d(data["train_years"]).astype(int).tolist()) == train_year_set
+                        and (
+                            str(np.asarray(data["rt_tag"]).item()) if "rt_tag" in data.files else ""
+                        ) == rt_tag
                         and np.asarray(data["source_quantiles"]).shape == (int(quantile_count), land_count)
                         and np.asarray(data["target_quantiles"]).shape == (int(quantile_count), land_count)
                     ):
@@ -264,6 +270,7 @@ def build_or_load_quantile_mapping(
                 month=np.array(month, dtype=np.int8),
                 lead=np.array(int(lead), dtype=np.int16),
                 land_count=np.array(land_count, dtype=np.int32),
+                rt_tag=np.array(rt_tag),
             )
             mappings[(month, int(lead))] = (source_q, target_q)
             sanity_errors.append(train_mean_mae)
@@ -373,7 +380,16 @@ def main() -> None:
     parser.add_argument("--qmap_cache_root", default="/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/quantile_mapping")
     parser.add_argument("--cv_stride", type=int, default=5)
     parser.add_argument("--quantile_count", type=int, default=51)
-    parser.add_argument("--weekdays", default="0,3", help="Python weekdays; default Monday,Thursday.")
+    parser.add_argument(
+        "--rt_tag",
+        default="",
+        help="Cycle tag such as rt2024. Keys input, quantile mapping, and default run name.",
+    )
+    parser.add_argument(
+        "--weekdays",
+        default=None,
+        help="Deprecated. Downloaded S2S hdate initializations are authoritative and are not weekday-filtered.",
+    )
     parser.add_argument("--max_calibration_samples", type=int, default=1000000)
     parser.add_argument("--calibration_steps", type=int, default=200)
     parser.add_argument("--calibration_lr", type=float, default=0.1)
@@ -383,10 +399,14 @@ def main() -> None:
     args = parser.parse_args()
 
     window_leads = ee.parse_int_list(args.window_leads)
+    rt_tag = normalize_rt_tag(args.rt_tag)
     configure_fold(args.cv_fold, window_leads, args.cv_stride)
-    run_name = args.run_name or f"cvfold{int(args.cv_fold)}_ens_w{ee.lead_list_label(window_leads)}"
+    run_suffix = f"_{rt_tag}" if rt_tag else ""
+    run_name = args.run_name or (
+        f"cvfold{int(args.cv_fold)}_ens_w{ee.lead_list_label(window_leads)}{run_suffix}"
+    )
     print(ENS_BENCHMARK_BANNER)
-    print(f"Fold={args.cv_fold}; run={run_name}; window={window_leads}")
+    print(f"Fold={args.cv_fold}; run={run_name}; cycle={rt_tag or 'legacy'}; window={window_leads}")
 
     shared_data = load_ens_scoring_shared_data(cfm.Config)
     norm_stats = ee.load_norm_stats()
@@ -397,7 +417,10 @@ def main() -> None:
     land_mask = cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5
     q95_z, base_rate, stats_path = load_window_stats(window_leads)
     print(f"Using existing PRISM event definition: {stats_path}")
-    files_by_init = load_ingested_files(Path(args.input_dir), window_leads)
+    input_dir = Path(args.input_dir)
+    if rt_tag and str(input_dir) == "/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/regridded":
+        input_dir = input_dir.with_name(f"regridded_{rt_tag}")
+    files_by_init = load_ingested_files(input_dir, window_leads)
     valid_init_indices = set(int(value) for value in train_indices + val_indices + test_indices)
     files_by_init = {
         init_t: path for init_t, path in files_by_init.items()
@@ -407,15 +430,11 @@ def main() -> None:
         raise RuntimeError(
             "No ENS inits remain after applying HeatCast continuous-season and lead-window guards."
         )
-    allowed_weekdays = set(ee.parse_int_list(args.weekdays))
-    datetimes = ee.time_datetimes(shared_data["time_values"])
-    files_by_init = {
-        init_t: path for init_t, path in files_by_init.items()
-        if datetimes[int(init_t)].weekday() in allowed_weekdays
-    }
-    if not files_by_init:
-        raise RuntimeError(f"No ENS inits remain after restricting to weekdays={sorted(allowed_weekdays)}.")
-    print(f"Restricted ENS scoring to common-init weekdays={sorted(allowed_weekdays)}.")
+    if args.weekdays:
+        print(
+            "Ignoring deprecated --weekdays: downloaded S2S hdate initializations are authoritative. "
+            "Historical hdates need not share the real-time model-date weekday."
+        )
     available_years = {int(years[init_t]) for init_t in files_by_init}
     retained = {
         "train": sorted(available_years & set(int(v) for v in train_years)),
@@ -435,6 +454,7 @@ def main() -> None:
         window_leads,
         Path(args.qmap_cache_root),
         args.quantile_count,
+        rt_tag,
     )
 
     calibration_records: List[Dict[str, np.ndarray]] = []
@@ -541,6 +561,7 @@ def main() -> None:
     )
     metadata = {
         "run_name": run_name,
+        "rt_tag": rt_tag,
         "fold": int(args.cv_fold),
         "window_leads": list(window_leads),
         "available_years": sorted(available_years),

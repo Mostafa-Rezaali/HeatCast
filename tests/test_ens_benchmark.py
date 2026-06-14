@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 import ens_ingest as ingest
+import ens_compare
 import ens_score
 from ens_common import (
     apply_quantile_mapping,
@@ -13,8 +14,8 @@ from ens_common import (
     intersection_years,
     member_fraction_probability,
 )
-from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu, retrieve
-from ens_ingest import load_init_list, load_native_daily_max, validate_ingested_output
+from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu, parse_year_list, retrieve
+from ens_ingest import find_raw_file, load_init_list, load_native_daily_max, normalize_rt_tag, validate_ingested_output
 from stitch_exceedance_folds import load_fold_inputs
 
 
@@ -107,6 +108,14 @@ def test_s2s_download_dates_and_ingest_init_list(tmp_path: Path):
     init_list = tmp_path / "init_list.txt"
     init_list.write_text("20020502\n20020502\n20020506\n", encoding="utf-8")
     assert load_init_list(init_list) == ["20020502", "20020506"]
+    assert parse_year_list("2022,2024,2022") == (2022, 2024)
+    assert normalize_rt_tag("2024") == "rt2024"
+    legacy = tmp_path / "ens_init_20020502.grib"
+    tagged = tmp_path / "ens_init_20020502_rt2024.grib"
+    legacy.touch()
+    tagged.touch()
+    assert find_raw_file(tmp_path, "20020502") == legacy
+    assert find_raw_file(tmp_path, "20020502", "rt2024") == tagged
 
 
 def test_s2s_retrieve_uses_current_ecds_dataset(tmp_path: Path):
@@ -242,6 +251,7 @@ def test_ingest_worker_writes_atomic_resume_safe_output(monkeypatch, tmp_path: P
         3,
         1,
         123,
+        "rt2024",
     ) == "20010701"
     assert output_path.exists()
     assert not list(tmp_path.glob("*.tmp.*"))
@@ -250,6 +260,7 @@ def test_ingest_worker_writes_atomic_resume_safe_output(monkeypatch, tmp_path: P
         assert np.all(np.isnan(saved["t2max"][:, :, 0, 1]))
         assert saved["init_time_index"].item() == 123
         assert saved["init_date"].item() == "20010701"
+        assert saved["rt_tag"].item() == "rt2024"
 
 
 def test_ens_score_configures_extended_global_fields_before_loading_stats(monkeypatch):
@@ -279,6 +290,7 @@ def test_ingest_resume_validator_rejects_corrupt_and_accepts_valid_metadata(tmp_
         init_date=np.array("20010702"),
         init_time_index=np.array(456, dtype=np.int32),
         variable=np.array("mx2t6"),
+        rt_tag=np.array("rt2024"),
     )
     valid, reason = validate_ingested_output(
         complete,
@@ -287,6 +299,7 @@ def test_ingest_resume_validator_rejects_corrupt_and_accepts_valid_metadata(tmp_
         expected_label="20010702",
         expected_init_time_index=456,
         expected_variable="mx2t6",
+        expected_rt_tag="rt2024",
     )
     assert valid, reason
 
@@ -331,6 +344,53 @@ def test_ens_score_submission_runs_bounded_parallel_folds_before_compare():
     assert script.index("All ENS folds complete; starting pooled comparison") < script.index(
         '"$PY" -u ens_compare.py'
     )
+    assert "--weekdays" not in script
+
+
+def test_cycle_probabilities_merge_duplicates_without_double_counting():
+    chunks = [
+        {
+            "init_margin": np.array([0.2, 0.4], dtype=np.float32),
+            "forecast_margin": np.array([0.0, 1.0], dtype=np.float32),
+        },
+        {
+            "init_margin": np.array([0.4, 0.8], dtype=np.float32),
+            "forecast_margin": np.array([1.0, 0.0], dtype=np.float32),
+        },
+    ]
+    raw, calibrated = ens_compare.merge_cycle_probabilities(chunks)
+    assert np.allclose(raw, np.array([0.3, 0.6], dtype=np.float32))
+    expected = 0.5 * (ens_compare.sigmoid(chunks[0]["forecast_margin"]) + ens_compare.sigmoid(chunks[1]["forecast_margin"]))
+    assert np.allclose(calibrated, expected)
+
+
+def test_cycle_run_templates_expand_per_fold():
+    groups = ens_compare.resolve_ens_run_groups(
+        ("cvfold{F}_ens_w34", "cvfold{F}_ens_w34_rt2024"),
+        tuple(f"cvfold{fold}_heatcast" for fold in range(5)),
+        Path("unused"),
+        tuple(range(15, 29)),
+    )
+    assert groups[3] == ["cvfold3_ens_w34", "cvfold3_ens_w34_rt2024"]
+    assert set(groups) == set(range(5))
+    assert ens_compare.cycle_label(groups[3][0]) == "legacy"
+    assert ens_compare.cycle_label(groups[3][1]) == "rt2024"
+    union, overlap = ens_compare.cycle_year_union({
+        "legacy": (1, 2, 3),
+        "rt2024": (3, 4, 5),
+    })
+    assert union == {1, 2, 3, 4, 5}
+    assert overlap == {3}
+
+
+def test_cycle_widen_submission_rescores_legacy_and_merges_by_year():
+    script = (Path(__file__).resolve().parents[1] / "submit_ens_widen_cycles.slurm").read_text(
+        encoding="utf-8"
+    )
+    assert "run_cycle \"\"" in script
+    assert "run_cycle rt2024" in script
+    assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script
+    assert "--emit_per_year" in script
 
 
 def test_ens_score_lightweight_loader_uses_only_disk_heat_and_time_cache(tmp_path: Path):

@@ -93,11 +93,27 @@ def load_init_list(path: Path) -> List[str]:
     return labels
 
 
-def find_raw_file(raw_dir: Path, init_label: str) -> Path | None:
+def normalize_rt_tag(value: str | None) -> str:
+    if value is None or not str(value).strip():
+        return ""
+    tag = str(value).strip()
+    return tag if tag.startswith("rt") else f"rt{tag}"
+
+
+def find_raw_file(raw_dir: Path, init_label: str, rt_tag: str = "") -> Path | None:
     candidates = []
+    tag = normalize_rt_tag(rt_tag)
     for suffix in (".nc", ".nc4", ".grib", ".grib2", ".grb", ".grb2"):
-        candidates.extend(sorted(raw_dir.glob(f"*{init_label}*{suffix}")))
+        pattern = f"*{init_label}*{tag}*{suffix}" if tag else f"*{init_label}*{suffix}"
+        candidates.extend(sorted(raw_dir.glob(pattern)))
     unique = list(dict.fromkeys(candidates))
+    if not tag and len(unique) > 1:
+        legacy = [
+            path for path in unique
+            if not any(part.startswith("rt") and part[2:].isdigit() for part in path.stem.split("_"))
+        ]
+        if len(legacy) == 1:
+            return legacy[0]
     if len(unique) > 1:
         raise RuntimeError(f"Multiple raw ENS files match init {init_label}: {unique}")
     return unique[0] if unique else None
@@ -274,6 +290,7 @@ def _write_ingested_output(
     label: str,
     init_time_index: int,
     variable: str,
+    rt_tag: str = "",
 ) -> None:
     temporary_path = output_path.with_suffix(output_path.suffix + f".tmp.{os.getpid()}")
     try:
@@ -286,6 +303,7 @@ def _write_ingested_output(
                 init_date=np.array(label),
                 init_time_index=np.array(init_time_index, dtype=np.int32),
                 variable=np.array(str(variable)),
+                rt_tag=np.array(normalize_rt_tag(rt_tag)),
             )
         os.replace(temporary_path, output_path)
     finally:
@@ -299,6 +317,7 @@ def validate_ingested_output(
     expected_label: str | None = None,
     expected_init_time_index: int | None = None,
     expected_variable: str | None = None,
+    expected_rt_tag: str | None = None,
 ) -> Tuple[bool, str]:
     required_keys = {"t2max", "leads", "members", "init_date", "init_time_index", "variable"}
     if not zipfile.is_zipfile(path):
@@ -313,6 +332,7 @@ def validate_ingested_output(
             label = str(np.asarray(data["init_date"]).item())
             init_time_index = int(np.asarray(data["init_time_index"]).item())
             variable = str(np.asarray(data["variable"]).item())
+            rt_tag = str(np.asarray(data["rt_tag"]).item()) if "rt_tag" in data.files else ""
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
     missing_leads = sorted(set(int(value) for value in required_leads) - set(leads))
@@ -326,6 +346,8 @@ def validate_ingested_output(
         return False, f"expected init_time_index={expected_init_time_index}, found {init_time_index}"
     if expected_variable is not None and variable != str(expected_variable):
         return False, f"expected variable={expected_variable}, found {variable}"
+    if expected_rt_tag is not None and rt_tag != normalize_rt_tag(expected_rt_tag):
+        return False, f"expected rt_tag={normalize_rt_tag(expected_rt_tag)}, found {rt_tag}"
     return True, "valid"
 
 
@@ -337,6 +359,7 @@ def ingest_one_init(
     max_lead: int,
     expected_members: int,
     init_time_index: int,
+    rt_tag: str = "",
 ) -> str:
     if _WORKER_LAND_MASK is None or _WORKER_TARGET_LAT is None or _WORKER_TARGET_LON is None:
         raise RuntimeError("ENS ingest worker was not initialized.")
@@ -362,6 +385,7 @@ def ingest_one_init(
         label,
         init_time_index,
         variable,
+        rt_tag,
     )
     return label
 
@@ -388,22 +412,33 @@ def main() -> None:
         default=None,
         help="Optional YYYYMMDD list from download_ecmwf_s2s.py; uses only available S2S inits.",
     )
+    parser.add_argument(
+        "--rt_tag",
+        default="",
+        help="Cycle tag such as rt2024. Selects tagged raw files and cycle-specific defaults.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.workers < 1:
         raise ValueError("--workers must be at least 1.")
 
     print(ENS_BENCHMARK_BANNER)
+    rt_tag = normalize_rt_tag(args.rt_tag)
     raw_dir = Path(args.raw_dir)
     output_dir = Path(args.output_dir)
+    if rt_tag and str(output_dir) == "/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/regridded":
+        output_dir = output_dir.with_name(f"regridded_{rt_tag}")
     output_dir.mkdir(parents=True, exist_ok=True)
     dates, date_lookup = load_training_dates(Path(args.training_data_path))
     import cfm_mesh_train as cfm
 
     cfm.Config.TRAINING_DATA_PATH = str(args.training_data_path)
     land_mask = cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5
-    if args.init_list:
-        init_labels = load_init_list(Path(args.init_list))
+    init_list_path = Path(args.init_list) if args.init_list else (
+        raw_dir / f"init_list_{rt_tag}.txt" if rt_tag else None
+    )
+    if init_list_path is not None:
+        init_labels = load_init_list(init_list_path)
         outside_axis = [label for label in init_labels if label not in date_lookup]
         if outside_axis:
             print(
@@ -419,7 +454,7 @@ def main() -> None:
             args.start_year,
             args.end_year,
         )
-    raw_files = {label: find_raw_file(raw_dir, label) for label in init_labels}
+    raw_files = {label: find_raw_file(raw_dir, label, rt_tag) for label in init_labels}
     missing = [label for label, path in raw_files.items() if path is None]
     if missing:
         preview = "\n".join(f"  init_{label}: no GRIB/NetCDF file under {raw_dir}" for label in missing[:100])
@@ -445,6 +480,7 @@ def main() -> None:
                 expected_label=label,
                 expected_init_time_index=int(init_time_index),
                 expected_variable=str(args.variable),
+                expected_rt_tag=rt_tag,
             )
             if valid:
                 skipped += 1
@@ -460,6 +496,7 @@ def main() -> None:
             int(args.max_lead),
             int(args.expected_members),
             int(init_time_index),
+            rt_tag,
         ))
 
     print(

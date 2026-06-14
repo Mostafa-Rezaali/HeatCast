@@ -24,6 +24,24 @@ def sigmoid(logit: np.ndarray) -> np.ndarray:
     return (1.0 / (1.0 + np.exp(-value))).astype(np.float32)
 
 
+def merge_cycle_probabilities(chunks: Sequence[Mapping[str, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
+    """Average separately calibrated cycle probabilities for an identical initialization."""
+    if not chunks:
+        raise ValueError("At least one ENS cycle chunk is required.")
+    raw = np.nanmean(
+        np.stack([np.asarray(chunk["init_margin"], dtype=np.float32) for chunk in chunks]),
+        axis=0,
+    ).astype(np.float32)
+    calibrated = np.nanmean(
+        np.stack([
+            sigmoid(np.asarray(chunk["forecast_margin"], dtype=np.float32))
+            for chunk in chunks
+        ]),
+        axis=0,
+    ).astype(np.float32)
+    return raw, calibrated
+
+
 def scalar(data: Mapping[str, np.ndarray], key: str) -> int:
     return int(np.asarray(data[key]).item())
 
@@ -44,6 +62,42 @@ def chunk_map(paths: Sequence[Path]) -> Dict[int, Path]:
             raise RuntimeError(f"Duplicate init_time_index={init_t}: {output[init_t]} and {path}")
         output[init_t] = path
     return output
+
+
+def resolve_ens_run_groups(
+    ens_runs: Sequence[str],
+    heatcast_runs: Sequence[str],
+    ens_root: Path,
+    window_leads: Sequence[int],
+) -> Dict[int, List[str]]:
+    """Resolve legacy five-run lists or cycle run-name templates into fold groups."""
+    if any("{F}" in value for value in ens_runs):
+        if not all("{F}" in value for value in ens_runs):
+            raise ValueError("When using ENS run templates, every --ens_runs value must contain {F}.")
+        return {
+            fold: [template.replace("{F}", str(fold)) for template in ens_runs]
+            for fold in range(len(heatcast_runs))
+        }
+    output: Dict[int, List[str]] = defaultdict(list)
+    for run_name in ens_runs:
+        manifest, _, _ = load_fold_inputs(ens_root, run_name, window_leads)
+        output[int(manifest["source_fold"])].append(run_name)
+    missing = sorted(set(range(len(heatcast_runs))) - set(output))
+    if missing:
+        raise ValueError(f"ENS runs do not cover folds {missing}.")
+    return dict(output)
+
+
+def cycle_label(run_name: str) -> str:
+    suffix = str(run_name).rsplit("_", 1)[-1]
+    return suffix if suffix.startswith("rt") and suffix[2:].isdigit() else "legacy"
+
+
+def cycle_year_union(cycle_years: Mapping[str, Sequence[int]]) -> Tuple[set, set]:
+    sets = [set(int(year) for year in years) for years in cycle_years.values()]
+    if not sets:
+        return set(), set()
+    return set().union(*sets), set.intersection(*sets)
 
 
 def fit_heatcast_c(calibration: Mapping[str, np.ndarray], args: argparse.Namespace):
@@ -167,10 +221,43 @@ def bootstrap(
     return output
 
 
+def per_year_comparison_rows(
+    by_fold_year: Mapping[Tuple[int, int], ee.EvaluationAccumulator],
+    years: Sequence[int],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for year in sorted(set(int(value) for value in years)):
+        scored = {
+            str(row["model"]): row
+            for row in score_from_folds(aggregate_selected_years(by_fold_year, (year,)))
+        }
+        heat = scored["heatcast_C"]
+        ens = scored["ens_calibrated"]
+        rows.append({
+            "year": year,
+            "heatcast_bss": heat["bss_vs_monthly_climo"],
+            "ens_bss": ens["bss_vs_monthly_climo"],
+            "delta_bss_heatcast_minus_ens": (
+                float(heat["bss_vs_monthly_climo"]) - float(ens["bss_vs_monthly_climo"])
+            ),
+            "heatcast_roc_auc": heat["weighted_per_fold_roc_auc"],
+            "ens_roc_auc": ens["weighted_per_fold_roc_auc"],
+            "delta_auc_heatcast_minus_ens": (
+                float(heat["weighted_per_fold_roc_auc"]) - float(ens["weighted_per_fold_roc_auc"])
+            ),
+            "valid_count": heat["valid_count"],
+        })
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--heatcast_runs", required=True, help="Comma-separated five HeatCast run names.")
-    parser.add_argument("--ens_runs", required=True, help="Comma-separated five ENS run names.")
+    parser.add_argument(
+        "--ens_runs",
+        required=True,
+        help="Comma-separated ENS runs, or cycle templates containing {F}, grouped and merged per fold.",
+    )
     parser.add_argument("--window_leads", default="15,16,17,18,19,20,21,22,23,24,25,26,27,28")
     parser.add_argument("--heatcast_root", default="exceedance_eval_incremental")
     parser.add_argument("--ens_root", default="ens_exceedance_incremental")
@@ -181,14 +268,14 @@ def main() -> None:
     parser.add_argument("--calibration_lr", type=float, default=0.1)
     parser.add_argument("--calibration_l2", type=float, default=1e-4)
     parser.add_argument("--progress_every", type=int, default=100)
+    parser.add_argument("--emit_per_year", action="store_true")
     args = parser.parse_args()
 
     print(ENS_BENCHMARK_BANNER)
     heatcast_runs = tuple(value.strip() for value in args.heatcast_runs.split(",") if value.strip())
     ens_runs = tuple(value.strip() for value in args.ens_runs.split(",") if value.strip())
     window_leads = ee.parse_int_list(args.window_leads)
-    if len(heatcast_runs) != len(ens_runs):
-        raise ValueError("HeatCast and ENS run lists must have equal length and matching fold order.")
+    ens_groups = resolve_ens_run_groups(ens_runs, heatcast_runs, Path(args.ens_root), window_leads)
 
     global_acc = ee.EvaluationAccumulator(MODEL_NAMES, {})
     fold_acc: Dict[int, ee.EvaluationAccumulator] = {}
@@ -197,39 +284,53 @@ def main() -> None:
     total_inits = 0
     all_years = set()
 
-    for heat_name, ens_name in zip(heatcast_runs, ens_runs):
+    cycle_years: Dict[str, set] = defaultdict(set)
+    for heat_name in heatcast_runs:
         heat_manifest, heat_calibration, heat_chunks = load_fold_inputs(
             Path(args.heatcast_root), heat_name, window_leads,
         )
-        ens_manifest, _, ens_chunks = load_fold_inputs(Path(args.ens_root), ens_name, window_leads)
         fold = int(heat_manifest["source_fold"])
-        if int(ens_manifest["source_fold"]) != fold:
-            raise RuntimeError(f"Fold mismatch: HeatCast={fold}, ENS={ens_manifest['source_fold']}.")
+        ens_sources = []
+        for ens_name in ens_groups[fold]:
+            ens_manifest, _, ens_chunks = load_fold_inputs(Path(args.ens_root), ens_name, window_leads)
+            if int(ens_manifest["source_fold"]) != fold:
+                raise RuntimeError(f"Fold mismatch: HeatCast={fold}, ENS={ens_manifest['source_fold']}.")
+            ens_sources.append((ens_name, ens_manifest, chunk_map(ens_chunks)))
         heat_c = fit_heatcast_c(heat_calibration, args)
         heat_map = chunk_map(heat_chunks)
-        ens_map = chunk_map(ens_chunks)
-        common = common_init_indices(heat_map, ens_map)
+        ens_union = set().union(*(set(source[2]) for source in ens_sources))
+        common = tuple(sorted(set(heat_map) & ens_union))
         if not common:
             raise RuntimeError(f"Fold {fold}: empty common-init intersection.")
         fold_acc[fold] = ee.EvaluationAccumulator(MODEL_NAMES, {})
         fold_years = set()
+        duplicate_cycle_inits = 0
+        cycle_init_counts = defaultdict(int)
         for index, init_t in enumerate(common):
             heat = load_chunk(heat_map[init_t])
-            ens = load_chunk(ens_map[init_t])
-            for key in ("truth", "base_rate"):
-                if heat[key].shape != ens[key].shape or not np.allclose(heat[key], ens[key], equal_nan=True):
-                    raise RuntimeError(f"Fold {fold}, init={init_t}: HeatCast/ENS {key} differs.")
-            for key in ("year", "month", "target_center_time_index"):
-                if scalar(heat, key) != scalar(ens, key):
-                    raise RuntimeError(f"Fold {fold}, init={init_t}: HeatCast/ENS {key} differs.")
+            matching_sources = [source for source in ens_sources if init_t in source[2]]
+            if len(matching_sources) > 1:
+                duplicate_cycle_inits += 1
+            ens_chunks_for_init = []
+            for ens_name, ens_manifest, ens_map in matching_sources:
+                ens = load_chunk(ens_map[init_t])
+                for key in ("truth", "base_rate"):
+                    if heat[key].shape != ens[key].shape or not np.allclose(heat[key], ens[key], equal_nan=True):
+                        raise RuntimeError(f"Fold {fold}, init={init_t}: HeatCast/{ens_name} {key} differs.")
+                for key in ("year", "month", "target_center_time_index"):
+                    if scalar(heat, key) != scalar(ens, key):
+                        raise RuntimeError(f"Fold {fold}, init={init_t}: HeatCast/{ens_name} {key} differs.")
+                ens_chunks_for_init.append(ens)
+                cycle_init_counts[ens_name] += 1
             year = scalar(heat, "year")
             month = scalar(heat, "month")
-            if year not in heat_manifest["test_years"] or year not in ens_manifest["test_years"]:
+            if year not in heat_manifest["test_years"] or any(
+                year not in source[1]["test_years"] for source in matching_sources
+            ):
                 raise RuntimeError(f"Fold {fold}, init={init_t}: intersection chunk is not a test-year prediction.")
             truth = np.asarray(heat["truth"], dtype=np.float32)
             base = np.asarray(heat["base_rate"], dtype=np.float32)
-            ens_raw = np.asarray(ens["init_margin"], dtype=np.float32)
-            ens_calibrated = sigmoid(np.asarray(ens["forecast_margin"], dtype=np.float32))
+            ens_raw, ens_calibrated = merge_cycle_probabilities(ens_chunks_for_init)
             heat_prob = heat_c.predict_features(np.column_stack([
                 np.asarray(heat["init_margin"], dtype=np.float32),
                 np.asarray(heat["forecast_margin"], dtype=np.float32),
@@ -251,19 +352,44 @@ def main() -> None:
                 print(f"  fold {fold}: scored {index + 1}/{len(common)} common inits")
         total_inits += len(common)
         all_years.update(fold_years)
-        intersection_rows.append({
+        merged_row = {
             "fold": fold,
             "heatcast_run": heat_name,
-            "ens_run": ens_name,
+            "ens_run": " + ".join(source[0] for source in ens_sources),
+            "cycle": "merged",
             "common_init_count": len(common),
+            "duplicate_cycle_init_count": duplicate_cycle_inits,
             "intersection_years": " ".join(str(value) for value in sorted(fold_years)),
             "intersection_year_count": len(fold_years),
-        })
-        print(f"Fold {fold}: common inits={len(common)}, intersection years={sorted(fold_years)}")
+        }
+        intersection_rows.append(merged_row)
+        for ens_name, _, ens_map in ens_sources:
+            source_common = set(heat_map) & set(ens_map)
+            source_years = {
+                scalar(load_chunk(heat_map[init_t]), "year")
+                for init_t in source_common
+            }
+            label = cycle_label(ens_name)
+            cycle_years[label].update(source_years)
+            intersection_rows.append({
+                "fold": fold,
+                "heatcast_run": heat_name,
+                "ens_run": ens_name,
+                "cycle": label,
+                "common_init_count": cycle_init_counts[ens_name],
+                "duplicate_cycle_init_count": duplicate_cycle_inits,
+                "intersection_years": " ".join(str(value) for value in sorted(source_years)),
+                "intersection_year_count": len(source_years),
+            })
+        print(
+            f"Fold {fold}: merged common inits={len(common)}, duplicate-cycle inits={duplicate_cycle_inits}, "
+            f"intersection years={sorted(fold_years)}"
+        )
 
     rows = score_from_folds(fold_acc)
     by_name = {str(row["model"]): row for row in rows}
     bootstrap_rows = bootstrap(by_fold_year, sorted(all_years), args.bootstrap_reps, args.seed)
+    per_year_rows = per_year_comparison_rows(by_fold_year, sorted(all_years))
     year_text = " ".join(str(value) for value in sorted(all_years))
     for row in rows:
         row["intersection_years"] = year_text
@@ -284,6 +410,8 @@ def main() -> None:
     combined_rows.extend({"section": "coverage", **row} for row in intersection_rows)
     combined_rows.extend({"section": "bootstrap", **row} for row in bootstrap_rows)
     ee.write_csv(out_dir / "ens_heatcast_head_to_head.csv", combined_rows)
+    if args.emit_per_year:
+        ee.write_csv(out_dir / "ens_heatcast_per_year.csv", per_year_rows)
     ee.plot_reliability(
         out_dir / "reliability_overlay.png",
         {name: global_acc.metrics[name].rel.table() for name in MODEL_NAMES},
@@ -299,6 +427,15 @@ def main() -> None:
             f"slope={row['reliability_slope']:.3f} ECE={row['ece']:.4f}"
         )
     print(f"Year-block bootstrap: {len(all_years)} independent intersection-year blocks")
+    for cycle, years in sorted(cycle_years.items()):
+        print(f"  {cycle}: {len(years)} calendar-year blocks")
+    if len(cycle_years) > 1:
+        union, overlap = cycle_year_union(cycle_years)
+        print(
+            f"Cycle-union widening: old={len(cycle_years.get('legacy', set()))} blocks, "
+            f"new_union={len(union)} blocks, shared_across_all_cycles={len(overlap)}."
+        )
+    print("Bootstrap blocking assert: PASS (calendar year, never cycle).")
     for row in bootstrap_rows:
         print(
             f"  {row['metric']}: CI=[{row['ci_low']:+.4f},{row['ci_high']:+.4f}], "

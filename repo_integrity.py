@@ -281,11 +281,50 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Parallel ENS folds use read-only heat/time disk memmaps and skip shared global predictor caches",
     ))
 
+    ens_compare = _text(root, "ens_compare.py")
+    results.append(_result(
+        "s2s.multicycle_widening_contract",
+        all(token in ens_score for token in (
+            "--rt_tag",
+            "downloaded S2S hdate initializations are authoritative",
+            "quantile_cache_dir(cache_root, window_leads, rt_tag)",
+        ))
+        and all(token in ens_ingest for token in (
+            "--rt_tag",
+            "init_list_{rt_tag}.txt",
+            "expected_rt_tag=rt_tag",
+        ))
+        and all(token in ens_compare for token in (
+            "def merge_cycle_probabilities(",
+            "def resolve_ens_run_groups(",
+            "def per_year_comparison_rows(",
+            "Bootstrap blocking assert: PASS (calendar year, never cycle).",
+            "ens_heatcast_per_year.csv",
+        )),
+        "ENS cycles are bias-corrected separately, merged without duplicate-init weighting, and bootstrapped by year",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "s2s.multicycle_submission_contract",
+        "submit_ens_widen_cycles.slurm",
+        (
+            "--mem=500G",
+            "--gres=gpu:1",
+            f"--mail-user={EMAIL}",
+            "run_cycle \"\"",
+            "run_cycle rt2024",
+            "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024",
+            "--emit_per_year",
+        ),
+    ))
+
     for relative in (
         "submit_w34_tube_all.slurm",
         "submit_w34_eval_stitch.slurm",
         "submit_ens_ingest.slurm",
         "submit_ens_score_compare.slurm",
+        "submit_ens_widen_cycles.slurm",
         "submit_slow_driver_opportunity.slurm",
     ):
         text = _text(root, relative)

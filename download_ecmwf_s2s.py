@@ -11,8 +11,9 @@ Prerequisites:
   Load ecCodes so grib_copy is available.
 
 Outputs:
-  raw_dir/ens_init_{HDATE}.grib
-  raw_dir/init_list.txt
+  raw_dir/ens_init_{HDATE}_rt{RTYEAR}.grib
+  raw_dir/init_list_rt{RTYEAR}.txt
+  raw_dir/init_list.txt  (combined unique hdate list)
 """
 
 from __future__ import annotations
@@ -79,8 +80,15 @@ def hindcast_dates(model_date: date, years: int) -> list[date]:
     return output
 
 
-def assemble_by_hdate(downloads: Path, parts: Path, raw_dir: Path) -> list[str]:
-    print("Splitting model files by hdate...")
+def parse_year_list(value: str) -> tuple[int, ...]:
+    years = tuple(dict.fromkeys(int(item.strip()) for item in str(value).split(",") if item.strip()))
+    if not years:
+        raise ValueError("At least one real-time year is required.")
+    return years
+
+
+def assemble_by_hdate(downloads: Path, parts: Path, raw_dir: Path, rt_year: int) -> list[str]:
+    print(f"Splitting rt{rt_year} model files by hdate...")
     for grib_path in sorted(downloads.glob("model_*.grib")):
         split_by_hdate(grib_path, parts)
 
@@ -92,11 +100,14 @@ def assemble_by_hdate(downloads: Path, parts: Path, raw_dir: Path) -> list[str]:
             raise RuntimeError(
                 f"Hindcast init {label}: expected one control and one perturbed part, found {pieces}."
             )
-        final = raw_dir / f"ens_init_{label}.grib"
+        final = raw_dir / f"ens_init_{label}_rt{int(rt_year)}.grib"
         with final.open("wb") as output:
             for piece in pieces:
                 output.write(piece.read_bytes())
-    (raw_dir / "init_list.txt").write_text("\n".join(labels) + "\n", encoding="utf-8")
+    (raw_dir / f"init_list_rt{int(rt_year)}.txt").write_text(
+        "\n".join(labels) + "\n",
+        encoding="utf-8",
+    )
     return labels
 
 
@@ -109,8 +120,13 @@ def main() -> None:
     parser.add_argument(
         "--rt_year",
         type=int,
-        default=2022,
-        help="Real-time year whose Mon/Thu model dates anchor the reforecasts.",
+        default=None,
+        help="Single-value alias for --rt_years.",
+    )
+    parser.add_argument(
+        "--rt_years",
+        default="2022",
+        help="Comma-separated real-time years whose Mon/Thu model dates anchor the reforecasts.",
     )
     parser.add_argument("--hindcast_years", type=int, default=20)
     parser.add_argument("--max_lead_days", type=int, default=28)
@@ -123,18 +139,10 @@ def main() -> None:
     args = parser.parse_args()
 
     raw_dir = Path(args.raw_dir)
-    downloads = raw_dir / "downloads"
-    parts = raw_dir / "parts"
-    for directory in (raw_dir, downloads, parts):
-        directory.mkdir(parents=True, exist_ok=True)
-
-    model_dates = list(mjjas_mon_thu(args.rt_year))
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    rt_years = (int(args.rt_year),) if args.rt_year is not None else parse_year_list(args.rt_years)
     max_step_hours = int(args.max_lead_days) * 24
-    print(
-        f"{len(model_dates)} model dates (MJJAS Mon/Thu {args.rt_year}), "
-        f"{args.hindcast_years} hindcast years each, steps 6..{max_step_hours}h."
-    )
-
+    client = None
     if not args.skip_download:
         try:
             import cdsapi
@@ -143,18 +151,35 @@ def main() -> None:
                 "Missing cdsapi>=0.7.7. Install it and configure ~/.cdsapirc for ECDS."
             ) from exc
         client = cdsapi.Client()
-        for model_date in model_dates:
-            hdates = hindcast_dates(model_date, args.hindcast_years)
-            for kind in ("cf", "pf"):
-                target = downloads / f"model_{model_date.strftime('%Y%m%d')}_{kind}.grib"
-                if target.exists() and target.stat().st_size > 0:
-                    print(f"  exists, skipping: {target.name}")
-                    continue
-                print(f"  retrieving {target.name} ({len(hdates)} hdates)...")
-                retrieve(client, model_date, hdates, kind, target, args.area, max_step_hours)
 
-    labels = assemble_by_hdate(downloads, parts, raw_dir)
-    print(f"Done: {len(labels)} init files in {raw_dir}, labels in init_list.txt")
+    combined_labels = set()
+    for rt_year in rt_years:
+        downloads = raw_dir / "downloads" / f"rt{rt_year}"
+        parts = raw_dir / "parts" / f"rt{rt_year}"
+        for directory in (downloads, parts):
+            directory.mkdir(parents=True, exist_ok=True)
+        model_dates = list(mjjas_mon_thu(rt_year))
+        print(
+            f"{len(model_dates)} model dates (MJJAS Mon/Thu {rt_year}), "
+            f"{args.hindcast_years} hindcast years each, steps 6..{max_step_hours}h."
+        )
+        for model_date in model_dates:
+            if not args.skip_download:
+                hdates = hindcast_dates(model_date, args.hindcast_years)
+                for kind in ("cf", "pf"):
+                    target = downloads / f"model_{model_date.strftime('%Y%m%d')}_{kind}.grib"
+                    if target.exists() and target.stat().st_size > 0:
+                        print(f"  exists, skipping: rt{rt_year}/{target.name}")
+                        continue
+                    print(f"  retrieving rt{rt_year}/{target.name} ({len(hdates)} hdates)...")
+                    retrieve(client, model_date, hdates, kind, target, args.area, max_step_hours)
+        labels = assemble_by_hdate(downloads, parts, raw_dir, rt_year)
+        combined_labels.update(labels)
+        print(f"Completed rt{rt_year}: {len(labels)} tagged init files.")
+
+    combined = sorted(combined_labels)
+    (raw_dir / "init_list.txt").write_text("\n".join(combined) + "\n", encoding="utf-8")
+    print(f"Done: {len(combined)} unique hdates across cycles; combined labels in init_list.txt")
     print("Next: submit submit_ens_ingest.slurm, then submit_ens_score_compare.slurm.")
 
 

@@ -48,7 +48,6 @@ score_fold() {
       --cv_fold "$fold" \
       --run_name "cvfold${fold}_ens_w34" \
       --window_leads "$LEADS" \
-      --weekdays 0,3 \
       --output_root ens_exceedance_incremental \
       >"$fold_log" 2>"$fold_err"
 }

@@ -11,9 +11,10 @@ import numpy as np
 ENS_BENCHMARK_BANNER = """ECMWF ENS benchmark on the HeatCast scoreboard
 ================================================
 Coverage: score only the per-fold intersection of ENS reforecast years and HeatCast test years.
-Initialization: score only common MJJAS Monday/Thursday initialization dates.
+Initialization: score the downloaded MJJAS S2S hdate initializations common to ENS and HeatCast.
 Variable: ENS daily maximum 2 m temperature versus PRISM T2max.
 Members: ENS probabilities use the 11-member reforecast fraction, calibrated on fold validation years.
+Cycle discipline: bias correction and calibration are fit separately for each model cycle before merging.
 Discipline: identical PRISM events, grid, thresholds, init dates, test years, and fold-safe calibration."""
 
 
