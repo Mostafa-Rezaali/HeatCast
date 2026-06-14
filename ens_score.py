@@ -34,6 +34,44 @@ def configure_fold(fold: int, window_leads: Sequence[int], cv_stride: int) -> No
     cfm.apply_extended_global_fields()
 
 
+def load_ens_scoring_shared_data(config=cfm.Config) -> Dict[str, np.ndarray]:
+    """Load only the read-only HeatCast arrays required by ENS scoring."""
+    cache_dir = Path(config.OUTPUT_DIR) / "data_cache"
+    paths = {
+        "heat_index": cache_dir / "heat_index.npy",
+        "time_values": cache_dir / "time_values.npy",
+    }
+    missing = [str(path) for path in paths.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing HeatCast scoring cache files: "
+            f"{missing}. Run a HeatCast training/evaluation setup once to build them."
+        )
+    try:
+        shared = {
+            name: np.load(path, mmap_mode="r")
+            for name, path in paths.items()
+        }
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Could not open read-only HeatCast scoring caches under {cache_dir}: {exc}. "
+            "Repair the disk cache before ENS scoring."
+        ) from exc
+    heat = shared["heat_index"]
+    time_values = shared["time_values"]
+    if heat.ndim != 3 or time_values.ndim != 1 or heat.shape[-1] != time_values.size:
+        raise RuntimeError(
+            "Invalid HeatCast scoring cache shapes: "
+            f"heat_index={heat.shape}, time_values={time_values.shape}."
+        )
+    print(
+        "Loaded lightweight ENS scoring cache: "
+        f"heat_index={heat.shape}, time_values={time_values.shape}; "
+        "global/local predictor caches intentionally skipped."
+    )
+    return shared
+
+
 def load_ingested_files(root: Path, window_leads: Sequence[int]) -> Dict[int, Path]:
     output: Dict[int, Path] = {}
     missing_leads: List[str] = []
@@ -350,7 +388,7 @@ def main() -> None:
     print(ENS_BENCHMARK_BANNER)
     print(f"Fold={args.cv_fold}; run={run_name}; window={window_leads}")
 
-    shared_data = cfm.prepare_shared_data(cfm.Config, rank=0, world_size=1, ddp=False)
+    shared_data = load_ens_scoring_shared_data(cfm.Config)
     norm_stats = ee.load_norm_stats()
     train_indices, val_indices, test_indices, train_years, val_years, test_years = ee.split_indices_for_config(shared_data)
     if set(train_years) & set(val_years) or set(train_years) & set(test_years) or set(val_years) & set(test_years):

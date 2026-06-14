@@ -271,6 +271,16 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "ENS quantile mappings require only observed valid target months and remain target-year fold safe",
     ))
 
+    results.append(_result(
+        "s2s.score_lightweight_cache_contract",
+        "def load_ens_scoring_shared_data(" in ens_score
+        and '"heat_index": cache_dir / "heat_index.npy"' in ens_score
+        and '"time_values": cache_dir / "time_values.npy"' in ens_score
+        and "shared_data = load_ens_scoring_shared_data(cfm.Config)" in ens_score
+        and "shared_data = cfm.prepare_shared_data" not in ens_score,
+        "Parallel ENS folds use read-only heat/time disk memmaps and skip shared global predictor caches",
+    ))
+
     for relative in (
         "submit_w34_tube_all.slurm",
         "submit_w34_eval_stitch.slurm",

@@ -331,3 +331,19 @@ def test_ens_score_submission_runs_bounded_parallel_folds_before_compare():
     assert script.index("All ENS folds complete; starting pooled comparison") < script.index(
         '"$PY" -u ens_compare.py'
     )
+
+
+def test_ens_score_lightweight_loader_uses_only_disk_heat_and_time_cache(tmp_path: Path):
+    cache_dir = tmp_path / "data_cache"
+    cache_dir.mkdir()
+    heat = np.zeros((2, 3, 4), dtype=np.float32)
+    time_values = np.arange(4, dtype=np.float64)
+    np.save(cache_dir / "heat_index.npy", heat)
+    np.save(cache_dir / "time_values.npy", time_values)
+    config = SimpleNamespace(OUTPUT_DIR=str(tmp_path))
+    shared = ens_score.load_ens_scoring_shared_data(config)
+    assert set(shared) == {"heat_index", "time_values"}
+    assert isinstance(shared["heat_index"], np.memmap)
+    assert isinstance(shared["time_values"], np.memmap)
+    assert shared["heat_index"].shape == heat.shape
+    assert shared["time_values"].shape == time_values.shape
