@@ -239,7 +239,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
         ))
         and all(token in ens_ingest_submission for token in (
             "--cpus-per-task=32",
-            "--workers 8",
+            "INGEST_WORKERS=${INGEST_WORKERS:-16}",
+            '--workers "$INGEST_WORKERS"',
             "export OMP_NUM_THREADS=1",
             "export MKL_NUM_THREADS=1",
         )),

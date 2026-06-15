@@ -16,6 +16,7 @@ set -euo pipefail
 
 WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
+INGEST_WORKERS=${INGEST_WORKERS:-16}
 
 cd "$WORK_DIR"
 module load cuda/12.9.1
@@ -35,4 +36,4 @@ git pull --ff-only origin codex/tube_v1
   --weekdays 0,3 \
   --max_lead 28 \
   --expected_members 11 \
-  --workers 8
+  --workers "$INGEST_WORKERS"

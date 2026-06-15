@@ -395,6 +395,8 @@ def test_cycle_widen_submission_rescores_legacy_and_merges_by_year():
     script = (Path(__file__).resolve().parents[1] / "submit_ens_widen_cycles.slurm").read_text(
         encoding="utf-8"
     )
+    assert "INGEST_WORKERS=${INGEST_WORKERS:-16}" in script
+    assert '--workers "$INGEST_WORKERS"' in script
     assert "run_cycle \"\"" in script
     assert "run_cycle rt2024" in script
     assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script

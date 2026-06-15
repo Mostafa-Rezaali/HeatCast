@@ -20,6 +20,7 @@ LEADS=15,16,17,18,19,20,21,22,23,24,25,26,27,28
 HEATCAST_RUNS=cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold3_w34_dist_v1,cvfold4_w34_dist_v1
 ENS_RUN_TEMPLATES='cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024'
 FOLD_WORKERS=${FOLD_WORKERS:-2}
+INGEST_WORKERS=${INGEST_WORKERS:-16}
 
 cd "$WORK_DIR"
 module load cuda/12.9.1
@@ -40,7 +41,7 @@ git pull --ff-only origin codex/tube_v1
   --variable mx2t6 \
   --max_lead 28 \
   --expected_members 11 \
-  --workers 8
+  --workers "$INGEST_WORKERS"
 
 score_fold_cycle() {
     local fold=$1
