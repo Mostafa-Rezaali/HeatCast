@@ -343,9 +343,28 @@ def audit_repository(root: Path) -> list[CheckResult]:
         ),
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "w34.best_monitor_head_to_head_contract",
+        "submit_w34_best_monitor_head_to_head.slurm",
+        (
+            "--mem=500G",
+            "--gres=gpu:5",
+            f"--mail-user={EMAIL}",
+            "EVAL_WORKERS=${EVAL_WORKERS:-5}",
+            "--checkpoint best_monitor",
+            "CUDA_VISIBLE_DEVICES=\"$gpu\"",
+            "exceedance_eval_w34_best_monitor",
+            "ens_head_to_head_best_monitor",
+            "ens_head_to_head_cycles",
+            "Checkpoint winner by HeatCast BSS then AUC",
+        ),
+    ))
+
     for relative in (
         "submit_w34_tube_all.slurm",
         "submit_w34_eval_stitch.slurm",
+        "submit_w34_best_monitor_head_to_head.slurm",
         "submit_ens_ingest.slurm",
         "submit_ens_score_compare.slurm",
         "submit_ens_widen_cycles.slurm",

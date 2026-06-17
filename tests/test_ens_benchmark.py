@@ -407,6 +407,20 @@ def test_cycle_widen_submission_rescores_legacy_and_merges_by_year():
     assert "--emit_per_year" in script
 
 
+def test_best_monitor_head_to_head_runs_parallel_fold_arbitration():
+    script = (Path(__file__).resolve().parents[1] / "submit_w34_best_monitor_head_to_head.slurm").read_text(
+        encoding="utf-8"
+    )
+    assert "#SBATCH --gres=gpu:5" in script
+    assert "EVAL_WORKERS=${EVAL_WORKERS:-5}" in script
+    assert "--checkpoint best_monitor" in script
+    assert "CUDA_VISIBLE_DEVICES=\"$gpu\"" in script
+    assert "exceedance_eval_w34_best_monitor" in script
+    assert "ens_head_to_head_best_monitor" in script
+    assert "ens_head_to_head_cycles" in script
+    assert "Checkpoint winner by HeatCast BSS then AUC" in script
+
+
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():
     source = (Path(__file__).resolve().parents[1] / "download_ecmwf_s2s.py").read_text(
         encoding="utf-8"
