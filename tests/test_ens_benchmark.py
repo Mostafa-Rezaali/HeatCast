@@ -421,6 +421,24 @@ def test_best_monitor_head_to_head_runs_parallel_fold_arbitration():
     assert "Checkpoint winner by HeatCast BSS then AUC" in script
 
 
+def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "ens_heatcast_stack_opportunity.py").read_text(encoding="utf-8")
+    script = (root / "submit_ens_stack_opportunity.slurm").read_text(encoding="utf-8")
+    assert "heatcast_ens_stack" in source
+    assert "crossfit_excluding_fold" in source
+    assert "if int(other) != int(fold)" in source
+    assert "paired_chunk(" in source
+    assert "merge_cycle_probabilities(ens_chunks)" in source
+    assert "init_time_index" in source
+    assert "opportunity_pair_bootstrap.csv" in source
+    assert "heatcast_top10_confidence" in source
+    assert "--mem=500G" in script
+    assert "--gres=gpu:1" in script
+    assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script
+    assert "--max_stack_samples_per_fold 500000" in script
+
+
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():
     source = (Path(__file__).resolve().parents[1] / "download_ecmwf_s2s.py").read_text(
         encoding="utf-8"

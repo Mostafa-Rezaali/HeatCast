@@ -210,6 +210,38 @@ def audit_repository(root: Path) -> list[CheckResult]:
         ),
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "s2s.heatcast_ens_stack_opportunity_contract",
+        "ens_heatcast_stack_opportunity.py",
+        (
+            "heatcast_ens_stack",
+            "crossfit_excluding_fold",
+            "paired_chunk(",
+            "merge_cycle_probabilities",
+            "init_time_index",
+            "heatcast_top10_confidence",
+            "opportunity_pair_bootstrap.csv",
+            "Cross-fit assert: PASS",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "s2s.stack_opportunity_submission_contract",
+        "submit_ens_stack_opportunity.slurm",
+        (
+            "--mem=500G",
+            "--gres=gpu:1",
+            f"--mail-user={EMAIL}",
+            "git pull --ff-only origin codex/tube_v1",
+            "ens_heatcast_stack_opportunity.py",
+            "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024",
+            "--bootstrap_reps 5000",
+            "--max_stack_samples_per_fold 500000",
+        ),
+    ))
+
     results.append(_result(
         "s2s.mixed_control_perturbed_grib_contract",
         all(token in ens_ingest for token in (
