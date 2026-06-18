@@ -433,10 +433,13 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     assert "init_time_index" in source
     assert "opportunity_pair_bootstrap.csv" in source
     assert "heatcast_top10_confidence" in source
+    assert "ThreadPoolExecutor(max_workers=fold_workers)" in source
+    assert "--fold_workers" in source
     assert "--mem=500G" in script
     assert "--gres=gpu:1" in script
     assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script
     assert "--max_stack_samples_per_fold 500000" in script
+    assert "--fold_workers 5" in script
 
 
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():

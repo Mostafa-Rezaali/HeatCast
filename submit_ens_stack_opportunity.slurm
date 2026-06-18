@@ -37,4 +37,5 @@ git pull --ff-only origin codex/tube_v1
   --output_dir ens_heatcast_stack_opportunity \
   --bootstrap_reps 5000 \
   --max_stack_samples_per_fold 500000 \
+  --fold_workers 5 \
   --emit_per_year

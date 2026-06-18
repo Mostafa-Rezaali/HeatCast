@@ -222,6 +222,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "init_time_index",
             "heatcast_top10_confidence",
             "opportunity_pair_bootstrap.csv",
+            "ThreadPoolExecutor(max_workers=fold_workers)",
+            "--fold_workers",
             "Cross-fit assert: PASS",
         ),
     ))
@@ -239,6 +241,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024",
             "--bootstrap_reps 5000",
             "--max_stack_samples_per_fold 500000",
+            "--fold_workers 5",
         ),
     ))
 

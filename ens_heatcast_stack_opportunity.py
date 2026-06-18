@@ -10,6 +10,7 @@ fold, and reports paired HeatCast-vs-ENS and stack-vs-ENS comparisons.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
@@ -286,6 +287,139 @@ def fit_stacker_for_excluded_fold(
     )
 
 
+def build_reservoir_for_fold(
+    fold: int,
+    info: Mapping[str, object],
+    max_stack_samples_per_fold: int,
+    seed: int,
+    progress_every: int,
+) -> Tuple[int, np.ndarray, np.ndarray]:
+    """Build a bounded paired reservoir for one fold."""
+    rng = np.random.default_rng(int(seed) + 1009 * int(fold))
+    common = info["common"]
+    per_init = max(1, int(np.ceil(float(max_stack_samples_per_fold) / max(len(common), 1))))
+    x_parts: List[np.ndarray] = []
+    y_parts: List[np.ndarray] = []
+    for index, init_t in enumerate(common):
+        data = paired_chunk(
+            fold,
+            int(init_t),
+            info["heat_map"][int(init_t)],
+            info["ens_sources"],
+            info["heat_c"],
+        )
+        x_part, y_part = sample_for_stack(data, per_init, rng)
+        if x_part.size:
+            x_parts.append(x_part)
+            y_parts.append(y_part)
+        if (index + 1) % max(1, int(progress_every)) == 0:
+            print(f"  fold {fold}: sampled stack rows from {index + 1}/{len(common)} paired inits")
+    x, y = downsample_rows(x_parts, y_parts, int(max_stack_samples_per_fold), rng)
+    print(f"  fold {fold}: stack reservoir rows={y.size}")
+    return int(fold), x, y
+
+
+def score_fold_chunks(
+    fold: int,
+    info: Mapping[str, object],
+    stacker,
+    progress_every: int,
+) -> Tuple[
+    int,
+    ee.EvaluationAccumulator,
+    Dict[Tuple[int, int], ee.EvaluationAccumulator],
+    Dict[str, ee.EvaluationAccumulator],
+    Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]],
+    Dict[str, object],
+    set[int],
+]:
+    """Score all paired chunks for one fold, returning independent accumulators."""
+    fold_acc = ee.EvaluationAccumulator(MODEL_NAMES, {})
+    by_fold_year: Dict[Tuple[int, int], ee.EvaluationAccumulator] = {}
+    subset_acc = {name: ee.EvaluationAccumulator(MODEL_NAMES, {}) for name in SUBSETS}
+    subset_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {
+        name: {} for name in SUBSETS
+    }
+    fold_years = set()
+    boundaries = info["boundaries"]
+    duplicate_cycle_inits = 0
+    for index, init_t in enumerate(info["common"]):
+        data = paired_chunk(
+            fold,
+            int(init_t),
+            info["heat_map"][int(init_t)],
+            info["ens_sources"],
+            info["heat_c"],
+        )
+        year = int(data["year"])
+        month = int(data["month"])
+        if year not in info["manifest"]["test_years"]:
+            raise RuntimeError(f"Fold {fold}, init={init_t}: chunk year {year} is not in fold test years.")
+        matching_sources = [source for source in info["ens_sources"] if int(init_t) in source[2]]
+        duplicate_cycle_inits += int(len(matching_sources) > 1)
+        truth = np.asarray(data["truth"], dtype=np.float32)
+        base = np.asarray(data["base"], dtype=np.float32)
+        ens_raw = np.asarray(data["ens_raw"], dtype=np.float32)
+        ens_cal = np.asarray(data["ens_calibrated"], dtype=np.float32)
+        heat_prob = np.asarray(data["heatcast_C"], dtype=np.float32)
+        features = np.asarray(data["features"], dtype=np.float32)
+        sigma = np.asarray(data["sigma"], dtype=np.float32)
+        stack_prob = stacker.predict_features(features)
+        mask = finite_mask(truth, base, ens_raw, ens_cal, heat_prob, stack_prob)
+        forecasts = {
+            REFERENCE: base,
+            "ens_raw_fraction": ens_raw,
+            ENS_MODEL: ens_cal,
+            HEATCAST_MODEL: heat_prob,
+            STACK_MODEL: stack_prob,
+        }
+        year_acc = by_fold_year.setdefault((fold, year), ee.EvaluationAccumulator(MODEL_NAMES, {}))
+        for name, probability in forecasts.items():
+            fold_acc.update(name, probability, truth, mask, month)
+            year_acc.update(name, probability, truth, mask, month)
+
+        confidence = np.abs(heat_prob - base)
+        subset_masks = {
+            "all": mask,
+            "heatcast_top10_confidence": mask & (confidence >= boundaries["top10_confidence_threshold"]),
+            "heatcast_low_sigma_tercile": mask & (sigma <= boundaries["low_sigma_threshold"]),
+            "heatcast_top10_and_low_sigma": (
+                mask
+                & (confidence >= boundaries["top10_confidence_threshold"])
+                & (sigma <= boundaries["low_sigma_threshold"])
+            ),
+        }
+        for subset_name, subset_mask in subset_masks.items():
+            update_subset_accumulators(
+                subset_acc,
+                subset_year_acc,
+                subset_name,
+                fold,
+                year,
+                month,
+                forecasts,
+                truth,
+                subset_mask,
+            )
+        fold_years.add(year)
+        if (index + 1) % max(1, int(progress_every)) == 0:
+            print(f"  fold {fold}: scored {index + 1}/{len(info['common'])} paired inits")
+    coverage_row = {
+        "fold": fold,
+        "heatcast_run": info["heat_name"],
+        "ens_run": " + ".join(source[0] for source in info["ens_sources"]),
+        "common_init_count": len(info["common"]),
+        "duplicate_cycle_init_count": duplicate_cycle_inits,
+        "intersection_years": " ".join(str(value) for value in sorted(fold_years)),
+        "intersection_year_count": len(fold_years),
+    }
+    print(
+        f"Fold {fold}: scored common_inits={len(info['common'])}, "
+        f"duplicate-cycle inits={duplicate_cycle_inits}, years={sorted(fold_years)}"
+    )
+    return fold, fold_acc, by_fold_year, subset_acc, subset_year_acc, coverage_row, fold_years
+
+
 def update_subset_accumulators(
     subset_acc: Mapping[str, ee.EvaluationAccumulator],
     subset_year_acc: Mapping[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]],
@@ -323,6 +457,7 @@ def main() -> None:
     parser.add_argument("--calibration_lr", type=float, default=0.1)
     parser.add_argument("--calibration_l2", type=float, default=1e-4)
     parser.add_argument("--max_stack_samples_per_fold", type=int, default=500000)
+    parser.add_argument("--fold_workers", type=int, default=1, help="Number of folds to stream concurrently.")
     parser.add_argument("--progress_every", type=int, default=100)
     parser.add_argument("--emit_per_year", action="store_true")
     args = parser.parse_args()
@@ -340,7 +475,7 @@ def main() -> None:
     fold_inputs: Dict[int, Dict[str, object]] = {}
     all_years = set()
     total_common_inits = 0
-    rng = np.random.default_rng(int(args.seed))
+    fold_workers = max(1, min(int(args.fold_workers), len(heatcast_runs)))
 
     print("Loading fold metadata and fitting per-fold HeatCast-C calibrators.")
     for heat_name in heatcast_runs:
@@ -380,33 +515,25 @@ def main() -> None:
             f"low_sigma<={boundaries['low_sigma_threshold']:.4f}"
         )
 
-    print("Building bounded paired reservoirs for cross-fitted HeatCast+ENS stacker.")
+    print(f"Building bounded paired reservoirs for cross-fitted HeatCast+ENS stacker with fold_workers={fold_workers}.")
     reservoir_x: Dict[int, np.ndarray] = {}
     reservoir_y: Dict[int, np.ndarray] = {}
-    for fold in sorted(fold_inputs):
-        info = fold_inputs[fold]
-        common = info["common"]
-        per_init = max(1, int(np.ceil(float(args.max_stack_samples_per_fold) / max(len(common), 1))))
-        x_parts: List[np.ndarray] = []
-        y_parts: List[np.ndarray] = []
-        for index, init_t in enumerate(common):
-            data = paired_chunk(
+    with ThreadPoolExecutor(max_workers=fold_workers) as pool:
+        futures = [
+            pool.submit(
+                build_reservoir_for_fold,
                 fold,
-                int(init_t),
-                info["heat_map"][int(init_t)],
-                info["ens_sources"],
-                info["heat_c"],
+                fold_inputs[fold],
+                int(args.max_stack_samples_per_fold),
+                int(args.seed),
+                int(args.progress_every),
             )
-            x_part, y_part = sample_for_stack(data, per_init, rng)
-            if x_part.size:
-                x_parts.append(x_part)
-                y_parts.append(y_part)
-            if (index + 1) % max(1, int(args.progress_every)) == 0:
-                print(f"  fold {fold}: sampled stack rows from {index + 1}/{len(common)} paired inits")
-        reservoir_x[fold], reservoir_y[fold] = downsample_rows(
-            x_parts, y_parts, int(args.max_stack_samples_per_fold), rng,
-        )
-        print(f"  fold {fold}: stack reservoir rows={reservoir_y[fold].size}")
+            for fold in sorted(fold_inputs)
+        ]
+        for future in as_completed(futures):
+            fold, x, y = future.result()
+            reservoir_x[fold] = x
+            reservoir_y[fold] = y
 
     stackers = {
         fold: fit_stacker_for_excluded_fold(fold, reservoir_x, reservoir_y, args)
@@ -418,7 +545,6 @@ def main() -> None:
             f"n={stacker.n_samples}, event_rate={stacker.event_rate:.4f}"
         )
 
-    global_acc = ee.EvaluationAccumulator(MODEL_NAMES, {})
     fold_acc: Dict[int, ee.EvaluationAccumulator] = {}
     by_fold_year: Dict[Tuple[int, int], ee.EvaluationAccumulator] = {}
     subset_acc = {name: ee.EvaluationAccumulator(MODEL_NAMES, {}) for name in SUBSETS}
@@ -428,90 +554,36 @@ def main() -> None:
     coverage_rows: List[Dict[str, object]] = []
     scored_years = set()
 
-    print("Scoring paired test chunks with cross-fitted stacker.")
-    for fold in sorted(fold_inputs):
-        info = fold_inputs[fold]
-        fold_acc[fold] = ee.EvaluationAccumulator(MODEL_NAMES, {})
-        fold_years = set()
-        stacker = stackers[fold]
-        boundaries = info["boundaries"]
-        duplicate_cycle_inits = 0
-        for index, init_t in enumerate(info["common"]):
-            data = paired_chunk(
+    print(f"Scoring paired test chunks with cross-fitted stacker using fold_workers={fold_workers}.")
+    with ThreadPoolExecutor(max_workers=fold_workers) as pool:
+        futures = [
+            pool.submit(
+                score_fold_chunks,
                 fold,
-                int(init_t),
-                info["heat_map"][int(init_t)],
-                info["ens_sources"],
-                info["heat_c"],
+                fold_inputs[fold],
+                stackers[fold],
+                int(args.progress_every),
             )
-            year = int(data["year"])
-            month = int(data["month"])
-            if year not in info["manifest"]["test_years"]:
-                raise RuntimeError(f"Fold {fold}, init={init_t}: chunk year {year} is not in fold test years.")
-            matching_sources = [source for source in info["ens_sources"] if int(init_t) in source[2]]
-            duplicate_cycle_inits += int(len(matching_sources) > 1)
-            truth = np.asarray(data["truth"], dtype=np.float32)
-            base = np.asarray(data["base"], dtype=np.float32)
-            ens_raw = np.asarray(data["ens_raw"], dtype=np.float32)
-            ens_cal = np.asarray(data["ens_calibrated"], dtype=np.float32)
-            heat_prob = np.asarray(data["heatcast_C"], dtype=np.float32)
-            features = np.asarray(data["features"], dtype=np.float32)
-            sigma = np.asarray(data["sigma"], dtype=np.float32)
-            stack_prob = stacker.predict_features(features)
-            mask = finite_mask(truth, base, ens_raw, ens_cal, heat_prob, stack_prob)
-            forecasts = {
-                REFERENCE: base,
-                "ens_raw_fraction": ens_raw,
-                ENS_MODEL: ens_cal,
-                HEATCAST_MODEL: heat_prob,
-                STACK_MODEL: stack_prob,
-            }
-            year_acc = by_fold_year.setdefault((fold, year), ee.EvaluationAccumulator(MODEL_NAMES, {}))
-            for name, probability in forecasts.items():
-                global_acc.update(name, probability, truth, mask, month)
-                fold_acc[fold].update(name, probability, truth, mask, month)
-                year_acc.update(name, probability, truth, mask, month)
-
-            confidence = np.abs(heat_prob - base)
-            subset_masks = {
-                "all": mask,
-                "heatcast_top10_confidence": mask & (confidence >= boundaries["top10_confidence_threshold"]),
-                "heatcast_low_sigma_tercile": mask & (sigma <= boundaries["low_sigma_threshold"]),
-                "heatcast_top10_and_low_sigma": (
-                    mask
-                    & (confidence >= boundaries["top10_confidence_threshold"])
-                    & (sigma <= boundaries["low_sigma_threshold"])
-                ),
-            }
-            for subset_name, subset_mask in subset_masks.items():
-                update_subset_accumulators(
-                    subset_acc,
-                    subset_year_acc,
-                    subset_name,
-                    fold,
-                    year,
-                    month,
-                    forecasts,
-                    truth,
-                    subset_mask,
-                )
-            fold_years.add(year)
-            scored_years.add(year)
-            if (index + 1) % max(1, int(args.progress_every)) == 0:
-                print(f"  fold {fold}: scored {index + 1}/{len(info['common'])} paired inits")
-        coverage_rows.append({
-            "fold": fold,
-            "heatcast_run": info["heat_name"],
-            "ens_run": " + ".join(source[0] for source in info["ens_sources"]),
-            "common_init_count": len(info["common"]),
-            "duplicate_cycle_init_count": duplicate_cycle_inits,
-            "intersection_years": " ".join(str(value) for value in sorted(fold_years)),
-            "intersection_year_count": len(fold_years),
-        })
-        print(
-            f"Fold {fold}: scored common_inits={len(info['common'])}, "
-            f"duplicate-cycle inits={duplicate_cycle_inits}, years={sorted(fold_years)}"
-        )
+            for fold in sorted(fold_inputs)
+        ]
+        for future in as_completed(futures):
+            (
+                fold,
+                fold_acc_one,
+                by_fold_year_one,
+                subset_acc_one,
+                subset_year_acc_one,
+                coverage_row,
+                fold_years,
+            ) = future.result()
+            fold_acc[fold] = fold_acc_one
+            by_fold_year.update(by_fold_year_one)
+            coverage_rows.append(coverage_row)
+            scored_years.update(fold_years)
+            for subset_name in SUBSETS:
+                for model in MODEL_NAMES:
+                    add_metric(subset_acc[subset_name].metrics[model], subset_acc_one[subset_name].metrics[model])
+                subset_year_acc[subset_name].update(subset_year_acc_one[subset_name])
 
     rows = score_rows_from_folds(fold_acc)
     by_name = {str(row["model"]): row for row in rows}
@@ -568,6 +640,10 @@ def main() -> None:
             for row in stacker.coefficient_rows()
         ],
     )
+    global_acc = ee.EvaluationAccumulator(MODEL_NAMES, {})
+    for source in fold_acc.values():
+        for model in MODEL_NAMES:
+            add_metric(global_acc.metrics[model], source.metrics[model])
     ee.plot_reliability(
         out_dir / "reliability_overlay.png",
         {name: global_acc.metrics[name].rel.table() for name in MODEL_NAMES},
