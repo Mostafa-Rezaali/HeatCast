@@ -25,6 +25,17 @@ ENS_MODEL = "ens_calibrated"
 HEATCAST_MODEL = "heatcast_C"
 STACK_MODEL = "heatcast_ens_stack"
 REFERENCE_MODEL = "windowed_climatology"
+PROBABILITY_THRESHOLDS = ("0.1", "0.2", "0.3", "0.5")
+PROBABILITY_THRESHOLD_FIELDS = (
+    "hit_rate_0.1",
+    "false_alarm_ratio_0.1",
+    "hit_rate_0.2",
+    "false_alarm_ratio_0.2",
+    "hit_rate_0.3",
+    "false_alarm_ratio_0.3",
+    "hit_rate_0.5",
+    "false_alarm_ratio_0.5",
+)
 
 
 def read_csv(path: Path, required: bool = True) -> List[Dict[str, str]]:
@@ -220,6 +231,61 @@ def build_operational_tables(evidence_dir: Path, table_dir: Path) -> List[Dict[s
     return rows
 
 
+def build_threshold_operating_table(stack_dir: Path, table_dir: Path) -> List[Dict[str, object]]:
+    scores, _ = extract_head_to_head(stack_dir)
+    rows: List[Dict[str, object]] = []
+    for model in (ENS_MODEL, HEATCAST_MODEL, STACK_MODEL):
+        row = scores[model]
+        for threshold in PROBABILITY_THRESHOLDS:
+            rows.append({
+                "model": model_label(model),
+                "probability_threshold": threshold,
+                "hit_rate": fmt(row.get(f"hit_rate_{threshold}"), signed=False),
+                "false_alarm_ratio": fmt(row.get(f"false_alarm_ratio_{threshold}"), signed=False),
+                "bss": fmt(row.get("bss_vs_monthly_climo")),
+                "roc_auc": fmt(row.get("roc_auc"), signed=False),
+                "pr_auc": fmt(row.get("pr_auc"), signed=False),
+            })
+    write_csv(table_dir / "table_7_probability_threshold_operating_points.csv", rows)
+    write_markdown_table(table_dir / "table_7_probability_threshold_operating_points.md", rows)
+    return rows
+
+
+def build_opportunity_probability_table(stack_dir: Path, table_dir: Path) -> List[Dict[str, object]]:
+    rows = read_csv(stack_dir / "opportunity_pair_summary.csv", required=False)
+    by_subset_model = {(row.get("subset", ""), row.get("model", "")): row for row in rows}
+    subset_labels = {
+        "all": "All paired cases",
+        "heatcast_top10_confidence": "Top 10% confidence",
+        "heatcast_low_sigma_tercile": "Low-sigma tercile",
+        "heatcast_top10_and_low_sigma": "Top confidence + low sigma",
+    }
+    output: List[Dict[str, object]] = []
+    for subset, label in subset_labels.items():
+        ens = by_subset_model.get((subset, ENS_MODEL))
+        stack = by_subset_model.get((subset, STACK_MODEL))
+        if not ens or not stack:
+            continue
+        output.append({
+            "subset": label,
+            "stack_bss": fmt(stack.get("bss_vs_monthly_climo")),
+            "ens_bss": fmt(ens.get("bss_vs_monthly_climo")),
+            "delta_bss_stack_minus_ens": fmt(f(stack.get("bss_vs_monthly_climo")) - f(ens.get("bss_vs_monthly_climo"))),
+            "stack_roc_auc": fmt(stack.get("roc_auc"), signed=False),
+            "ens_roc_auc": fmt(ens.get("roc_auc"), signed=False),
+            "delta_roc_auc_stack_minus_ens": fmt(f(stack.get("roc_auc")) - f(ens.get("roc_auc"))),
+            "stack_pr_auc": fmt(stack.get("pr_auc"), signed=False),
+            "ens_pr_auc": fmt(ens.get("pr_auc"), signed=False),
+            "stack_ece": fmt(stack.get("ece"), signed=False),
+            "ens_ece": fmt(ens.get("ece"), signed=False),
+            "delta_ece_stack_minus_ens": fmt(f(stack.get("ece")) - f(ens.get("ece"))),
+            "valid_cells": int(f(stack.get("valid_count"))) if math.isfinite(f(stack.get("valid_count"))) else 0,
+        })
+    write_csv(table_dir / "table_8_opportunity_probability_metrics.csv", output)
+    write_markdown_table(table_dir / "table_8_opportunity_probability_metrics.md", output)
+    return output
+
+
 def plot_headline(stack_dir: Path, fig_dir: Path) -> None:
     plt = ensure_matplotlib()
     scores, boot = extract_head_to_head(stack_dir)
@@ -411,6 +477,125 @@ def plot_mechanism(stack_dir: Path, fig_dir: Path) -> None:
     plt.close(fig)
 
 
+def plot_probability_scorecard(stack_dir: Path, fig_dir: Path) -> None:
+    plt = ensure_matplotlib()
+    scores, _ = extract_head_to_head(stack_dir)
+    models = [ENS_MODEL, HEATCAST_MODEL, STACK_MODEL]
+    metrics = [
+        ("Brier", "brier", "lower"),
+        ("BSS", "bss_vs_monthly_climo", "higher"),
+        ("ROC-AUC", "roc_auc", "higher"),
+        ("PR-AUC", "pr_auc", "higher"),
+        ("Slope", "reliability_slope", "target_one"),
+        ("ECE", "ece", "lower"),
+    ]
+    raw = [[f(scores[model].get(column)) for _, column, _ in metrics] for model in models]
+    normalized: List[List[float]] = []
+    for row_idx, _ in enumerate(models):
+        normalized.append([])
+        for col_idx, (_, _, direction) in enumerate(metrics):
+            column = [raw[r][col_idx] for r in range(len(models))]
+            finite = [value for value in column if math.isfinite(value)]
+            if not finite or max(finite) == min(finite):
+                normalized[row_idx].append(0.5)
+                continue
+            value = raw[row_idx][col_idx]
+            if direction == "target_one":
+                distances = [abs(item - 1.0) for item in finite]
+                distance = abs(value - 1.0)
+                score = 1.0 - ((distance - min(distances)) / (max(distances) - min(distances) + 1e-12))
+            else:
+                score = (value - min(finite)) / (max(finite) - min(finite))
+            if direction == "lower":
+                score = 1.0 - score
+            normalized[row_idx].append(score)
+
+    fig, ax = plt.subplots(figsize=(8.8, 3.4))
+    image = ax.imshow(normalized, cmap="viridis", aspect="auto", vmin=0, vmax=1)
+    ax.set_xticks(range(len(metrics)), [name for name, _, _ in metrics])
+    ax.set_yticks(range(len(models)), [model_label(model) for model in models])
+    ax.set_title("Probabilistic performance scorecard")
+    for i, model in enumerate(models):
+        for j, (metric_name, _, _) in enumerate(metrics):
+            value = raw[i][j]
+            text = fmt(value, digits=3, signed=metric_name in {"BSS"})
+            ax.text(j, i, text, ha="center", va="center", color="white" if normalized[i][j] < 0.45 else "black", fontsize=8)
+    cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02)
+    cbar.set_label("Within-metric rank score")
+    savefig(fig, fig_dir / "figure_5_probabilistic_scorecard")
+    plt.close(fig)
+
+
+def plot_threshold_operating_curves(stack_dir: Path, fig_dir: Path) -> None:
+    plt = ensure_matplotlib()
+    scores, _ = extract_head_to_head(stack_dir)
+    thresholds = [float(threshold) for threshold in PROBABILITY_THRESHOLDS]
+    models = [ENS_MODEL, HEATCAST_MODEL, STACK_MODEL]
+    colors = {ENS_MODEL: "#4C78A8", HEATCAST_MODEL: "#F58518", STACK_MODEL: "#54A24B"}
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.5), sharex=True)
+    for model in models:
+        row = scores[model]
+        hits = [f(row.get(f"hit_rate_{threshold:.1f}")) for threshold in thresholds]
+        fars = [f(row.get(f"false_alarm_ratio_{threshold:.1f}")) for threshold in thresholds]
+        axes[0].plot(thresholds, hits, marker="o", color=colors[model], label=model_label(model))
+        axes[1].plot(thresholds, fars, marker="o", color=colors[model], label=model_label(model))
+    axes[0].set_ylabel("Hit rate")
+    axes[1].set_ylabel("False-alarm ratio")
+    for ax in axes:
+        ax.set_xlabel("Issued probability threshold")
+        ax.set_xticks(thresholds)
+        ax.set_ylim(-0.02, 1.02)
+        ax.spines[["top", "right"]].set_visible(False)
+    axes[0].set_title("Event detection")
+    axes[1].set_title("False alarms")
+    axes[1].legend(frameon=False, loc="lower right")
+    fig.suptitle("Probability-threshold operating characteristics", y=1.03)
+    savefig(fig, fig_dir / "figure_6_probability_threshold_operating_curves")
+    plt.close(fig)
+
+
+def plot_opportunity_probability_metrics(stack_dir: Path, fig_dir: Path) -> None:
+    plt = ensure_matplotlib()
+    rows = read_csv(stack_dir / "opportunity_pair_summary.csv", required=False)
+    by_subset_model = {(row.get("subset", ""), row.get("model", "")): row for row in rows}
+    subset_order = [
+        ("all", "All"),
+        ("heatcast_top10_confidence", "Top conf."),
+        ("heatcast_low_sigma_tercile", "Low sigma"),
+        ("heatcast_top10_and_low_sigma", "Top+low"),
+    ]
+    labels: List[str] = []
+    delta_bss: List[float] = []
+    delta_auc: List[float] = []
+    delta_ece: List[float] = []
+    for subset, label in subset_order:
+        ens = by_subset_model.get((subset, ENS_MODEL))
+        stack = by_subset_model.get((subset, STACK_MODEL))
+        if not ens or not stack:
+            continue
+        labels.append(label)
+        delta_bss.append(f(stack.get("bss_vs_monthly_climo")) - f(ens.get("bss_vs_monthly_climo")))
+        delta_auc.append(f(stack.get("roc_auc")) - f(ens.get("roc_auc")))
+        delta_ece.append(f(stack.get("ece")) - f(ens.get("ece")))
+
+    fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.2), constrained_layout=True)
+    x = list(range(len(labels)))
+    axes[0].bar(x, delta_bss, color="#54A24B")
+    axes[0].set_ylabel("Stack - ENS BSS")
+    axes[1].bar(x, delta_auc, color="#4C78A8")
+    axes[1].set_ylabel("Stack - ENS ROC-AUC")
+    axes[2].bar(x, delta_ece, color="#E45756")
+    axes[2].set_ylabel("Stack - ENS ECE")
+    axes[2].text(0.5, 0.93, "Lower is better", transform=axes[2].transAxes, ha="center", fontsize=8)
+    for ax in axes:
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xticks(x, labels, rotation=20, ha="right")
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.suptitle("Opportunity-regime probabilistic deltas", y=1.08)
+    savefig(fig, fig_dir / "figure_7_opportunity_probability_metrics")
+    plt.close(fig)
+
+
 def write_methods(path: Path, git_commit: str) -> None:
     text = f"""# Methods Text Draft: HeatCast/ENS W34 Verification
 
@@ -425,6 +610,9 @@ ECMWF S2S reforecasts are evaluated on exactly the same initialization dates, ta
 
 ## HeatCast+ENS stack
 The stack forecast is a validation-year logistic combination of calibrated ENS and HeatCast features. For each scored fold, the stacker excludes that fold from its fitting data. It is scored only on held-out test years. This tests whether HeatCast contributes incremental information beyond ENS, rather than whether HeatCast alone dominates ENS.
+
+## Probabilistic diagnostics
+The primary verification metrics are Brier skill score against fold-safe windowed climatology, reliability slope, expected calibration error, and paired ROC-AUC. Secondary operating diagnostics include PR-AUC and threshold-specific hit rates and false-alarm ratios at probability cutoffs 0.1, 0.2, 0.3, and 0.5. Opportunity-regime analyses are reported on the same paired HeatCast/ENS cases.
 
 ## Uncertainty
 The primary uncertainty estimate is a paired year-block bootstrap over independent held-out calendar years. Reported confidence intervals therefore account for temporal dependence across grid cells within a year and avoid treating cell-days as independent replicates.
@@ -471,6 +659,7 @@ def write_investigation_record(path: Path) -> None:
 10. Robustness checks showed positive Stack-vs-ENS BSS gain under leave-one-fold, leave-one-month, and leave-one-year tests.
 11. Opportunity tests showed significant Stack-vs-ENS gains in high-confidence and low-sigma regimes.
 12. Slow-driver tests did not resolve a significant MJO phase-8 enhancement; driver mechanism claims remain exploratory/contextual.
+13. Paper-figure packaging added probability-focused panels for Brier/BSS/AUC/PR-AUC/calibration, threshold-specific hit and false-alarm behavior, and opportunity-regime probability metrics.
 
 Scientific conclusion: the defensible Nature Communications narrative is incremental information and operational risk improvement, not standalone model dominance or a resolved MJO mechanism.
 """
@@ -568,9 +757,14 @@ def main() -> None:
     build_robustness_tables(evidence_dir, stack_dir, table_dir)
     build_mechanism_tables(evidence_dir, table_dir)
     build_operational_tables(evidence_dir, table_dir)
+    build_threshold_operating_table(stack_dir, table_dir)
+    build_opportunity_probability_table(stack_dir, table_dir)
     plot_headline(stack_dir, fig_dir)
     plot_robustness(evidence_dir, stack_dir, fig_dir)
     plot_mechanism(stack_dir, fig_dir)
+    plot_probability_scorecard(stack_dir, fig_dir)
+    plot_threshold_operating_curves(stack_dir, fig_dir)
+    plot_opportunity_probability_metrics(stack_dir, fig_dir)
     copy_reproducibility_files(root, output_dir, stack_dir, evidence_dir, opportunity_dir)
     commit = write_reproducibility(
         output_dir / "reproducibility_manifest.json",

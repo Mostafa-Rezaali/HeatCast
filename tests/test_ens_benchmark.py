@@ -483,6 +483,13 @@ def test_paper_figures_tables_package_is_cpu_only_and_records_claim_boundaries()
     assert "figure_2_headline_stack_minus_ens_ci" in source
     assert "figure_3_robustness" in source
     assert "figure_4_opportunity_and_driver_tests" in source
+    assert "figure_5_probabilistic_scorecard" in source
+    assert "figure_6_probability_threshold_operating_curves" in source
+    assert "figure_7_opportunity_probability_metrics" in source
+    assert "table_7_probability_threshold_operating_points" in source
+    assert "table_8_opportunity_probability_metrics" in source
+    assert "hit_rate_0.2" in source
+    assert "false_alarm_ratio_0.2" in source
     assert "methods_text_draft.md" in source
     assert "narrative_and_claim_boundaries.md" in source
     assert "investigation_record.md" in source
