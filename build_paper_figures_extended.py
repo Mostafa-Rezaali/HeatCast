@@ -41,7 +41,7 @@ from build_paper_figures_tables import (
     write_csv,
     write_markdown_table,
 )
-from ens_compare import chunk_map, fit_heatcast_c, load_chunk, resolve_ens_run_groups
+from ens_compare import chunk_map, fit_heatcast_c, load_chunk
 from ens_heatcast_stack_opportunity import (
     MODEL_NAMES,
     SUBSETS,
@@ -275,7 +275,7 @@ def make_fold_inputs(args: argparse.Namespace, window_leads: Sequence[int]) -> D
     ens_runs = tuple(v.strip() for v in args.ens_runs.split(",") if v.strip())
     heatcast_root = Path(args.heatcast_root)
     ens_root = Path(args.ens_root)
-    ens_groups = resolve_ens_run_groups(ens_runs, heatcast_runs, ens_root, window_leads)
+    ens_groups = resolve_ens_run_groups_flexible(ens_runs, heatcast_runs, ens_root, window_leads)
     fold_inputs: Dict[int, Dict[str, object]] = {}
     for heat_name in heatcast_runs:
         heat_manifest, heat_calibration, heat_chunks = load_fold_inputs(heatcast_root, heat_name, window_leads)
@@ -307,6 +307,37 @@ def make_fold_inputs(args: argparse.Namespace, window_leads: Sequence[int]) -> D
             "boundaries": fit_opportunity_boundaries(heat_calibration, heat_c),
         }
     return fold_inputs
+
+
+def resolve_ens_run_groups_flexible(
+    ens_runs: Sequence[str],
+    heatcast_runs: Sequence[str],
+    ens_root: Path,
+    window_leads: Sequence[int],
+) -> Dict[int, List[str]]:
+    """Resolve ENS run groups from templates, explicit run names, or a mixture.
+
+    The shared ens_compare resolver is intentionally strict: once a template is
+    used, every entry must contain {F}.  The extended figure builder is a
+    post-processing tool and should tolerate practical inputs such as one
+    template plus one already-expanded cycle.  Explicit run names are assigned
+    by reading their fold manifest; template names are expanded for every fold.
+    """
+    output: Dict[int, List[str]] = {fold: [] for fold in range(len(heatcast_runs))}
+    explicit: List[str] = []
+    for value in ens_runs:
+        if "{F}" in value:
+            for fold in range(len(heatcast_runs)):
+                output[fold].append(value.replace("{F}", str(fold)))
+        else:
+            explicit.append(value)
+    for run_name in explicit:
+        manifest, _, _ = load_fold_inputs(ens_root, run_name, window_leads)
+        output[int(manifest["source_fold"])].append(run_name)
+    missing = [fold for fold, names in output.items() if not names]
+    if missing:
+        raise ValueError(f"ENS runs do not cover folds {missing}.")
+    return output
 
 
 def fit_stackers(fold_inputs: Mapping[int, Mapping[str, object]], args: argparse.Namespace) -> Dict[int, object]:
@@ -645,6 +676,29 @@ def write_per_lead_profile(args: argparse.Namespace, out_dir: Path, sources: Dic
             "reason": "No per-lead stitched CSV was found. Saved window chunks do not contain individual lead predictions, so this panel requires an upstream per-lead export.",
         }]
         write_csv(out_dir / PER_LEAD_CSV, rows)
+        plt = ensure_matplotlib()
+        fig, ax = plt.subplots(figsize=(7.0, 2.8))
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.58,
+            "Per-lead W34 profile unavailable",
+            ha="center",
+            va="center",
+            fontsize=14,
+            weight="bold",
+        )
+        ax.text(
+            0.5,
+            0.38,
+            "Saved window chunks do not contain individual lead predictions.\nRun an upstream per-lead export to populate this panel.",
+            ha="center",
+            va="center",
+            fontsize=10,
+        )
+        savefig(fig, out_dir / "figure_8_per_lead_profile")
+        plt.close(fig)
+        sources["figure_8_per_lead_profile"] = source_entry(out_dir / PER_LEAD_CSV, ["status", "reason"], "placeholder because no per-lead stitched CSV exists")
         return
     rows = read_csv(source)
     write_csv(out_dir / PER_LEAD_CSV, rows)

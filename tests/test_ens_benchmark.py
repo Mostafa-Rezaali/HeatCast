@@ -530,6 +530,46 @@ def test_extended_paper_per_cell_auc_and_year_fold_map(tmp_path: Path):
     assert paper_ext.year_to_fold_from_head_to_head(stack_dir) == {2001: 0, 2006: 0, 2003: 2, 2008: 2}
 
 
+def test_extended_paper_flexible_ens_run_resolver_allows_mixed_templates(tmp_path: Path):
+    for fold in range(2):
+        root = tmp_path / f"cvfold{fold}_explicit" / "test" / "window_15-16"
+        array_dir = root / "incremental_arrays"
+        chunk_dir = array_dir / "test_chunks"
+        chunk_dir.mkdir(parents=True)
+        np.savez_compressed(
+            array_dir / "manifest.npz",
+            run_name=np.array(f"cvfold{fold}_explicit"),
+            source_fold=np.array(fold, dtype=np.int16),
+            target_mode=np.array("window"),
+            window_leads=np.array([15, 16], dtype=np.int16),
+            train_years=np.array([2000], dtype=np.int16),
+            calibration_years=np.array([2001], dtype=np.int16),
+            test_years=np.array([2002 + fold], dtype=np.int16),
+            calibration_split=np.array("val"),
+            eval_split=np.array("test"),
+            sample_count=np.array(0, dtype=np.int32),
+            valid_cell_count=np.array(0, dtype=np.int64),
+        )
+        np.savez_compressed(
+            array_dir / "calibration_pairs.npz",
+            init_margin=np.empty(0, dtype=np.float32),
+            forecast_margin=np.empty(0, dtype=np.float32),
+            model_sigma=np.empty(0, dtype=np.float32),
+            truth=np.empty(0, dtype=np.float32),
+            base_rate=np.empty(0, dtype=np.float32),
+            year=np.empty(0, dtype=np.int16),
+            source_fold=np.array(fold, dtype=np.int16),
+        )
+    groups = paper_ext.resolve_ens_run_groups_flexible(
+        ("cvfold{F}_templated", "cvfold0_explicit", "cvfold1_explicit"),
+        ("heat0", "heat1"),
+        tmp_path,
+        (15, 16),
+    )
+    assert groups[0] == ["cvfold0_templated", "cvfold0_explicit"]
+    assert groups[1] == ["cvfold1_templated", "cvfold1_explicit"]
+
+
 def test_extended_paper_submission_is_cpu_only_and_auditable():
     root = Path(__file__).resolve().parents[1]
     source = (root / "build_paper_figures_extended.py").read_text(encoding="utf-8")
