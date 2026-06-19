@@ -17,6 +17,7 @@ from ens_common import (
 from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu, parse_year_list, retrieve
 from ens_ingest import find_raw_file, load_init_list, load_native_daily_max, normalize_rt_tag, validate_ingested_output
 from stitch_exceedance_folds import load_fold_inputs
+import build_paper_figures_extended as paper_ext
 
 
 def test_quantile_mapping_is_monotonic_and_reproduces_train_distribution():
@@ -500,6 +501,52 @@ def test_paper_figures_tables_package_is_cpu_only_and_records_claim_boundaries()
     assert "--partition=hpg-b200" not in script
     assert "--mem=32G" in script
     assert "build_paper_figures_tables.py" in script
+
+
+def test_extended_paper_murphy_decomposition_reconstructs_brier():
+    prob = np.array([0.1, 0.2, 0.8, 0.9], dtype=np.float32)
+    truth = np.array([0, 0, 1, 1], dtype=np.float32)
+    dec = paper_ext.murphy_decomposition(prob, truth, n_bins=2)
+    assert abs(dec["brier"] - np.mean((prob - truth) ** 2)) < 1e-8
+    assert abs(dec["murphy_reconstructed_brier"] - dec["brier"]) < 0.03
+    assert dec["resolution"] > 0
+
+
+def test_extended_paper_per_cell_auc_and_year_fold_map(tmp_path: Path):
+    prob = np.array([[0.1, 0.7], [0.4, 0.2], [0.8, 0.9], [0.9, 0.1]], dtype=np.float32)
+    truth = np.array([[0, 1], [0, 0], [1, 1], [1, 0]], dtype=np.float32)
+    auc = paper_ext.auc_per_cell(prob, truth)
+    assert np.allclose(auc, np.array([1.0, 1.0], dtype=np.float32))
+
+    stack_dir = tmp_path / "stack"
+    stack_dir.mkdir()
+    paper_ext.write_csv(
+        stack_dir / "heatcast_ens_stack_head_to_head.csv",
+        [
+            {"section": "coverage", "fold": 0, "intersection_years": "2001 2006"},
+            {"section": "coverage", "fold": 2, "intersection_years": "2003 2008"},
+        ],
+    )
+    assert paper_ext.year_to_fold_from_head_to_head(stack_dir) == {2001: 0, 2006: 0, 2003: 2, 2008: 2}
+
+
+def test_extended_paper_submission_is_cpu_only_and_auditable():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "build_paper_figures_extended.py").read_text(encoding="utf-8")
+    script = (root / "submit_paper_figures_extended.slurm").read_text(encoding="utf-8")
+    assert "figure_5_spatial_skill" in source
+    assert "figure_6_reliability_decomposition" in source
+    assert "figure_7_case_studies" in source
+    assert "figure_8_per_lead_profile" in source
+    assert "figure_9_opportunity_discard_curve" in source
+    assert "table_7_stack_ablation_probability" in source
+    assert "table_8_per_year_head_to_head" in source
+    assert "table_9_computational_cost_comparison" in source
+    assert "reproducibility_manifest.json" in source
+    assert "--gres=gpu" not in script
+    assert "module load cuda" not in script
+    assert "--mem=64G" in script
+    assert "repo_integrity.py" in script
 
 
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():

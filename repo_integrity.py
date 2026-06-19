@@ -357,6 +357,48 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Paper figure/table builder is CPU-only and does not request B200 GPUs",
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "paper.figures_extended_contract",
+        "build_paper_figures_extended.py",
+        (
+            "figure_5_spatial_skill",
+            "figure_6_reliability_decomposition",
+            "figure_7_case_studies",
+            "figure_8_per_lead_profile",
+            "figure_9_opportunity_discard_curve",
+            "table_7_stack_ablation_probability",
+            "table_8_per_year_head_to_head",
+            "table_9_computational_cost_comparison",
+            "murphy_decomposition",
+            "auc_per_cell",
+            "reproducibility_manifest.json",
+            "source_entry",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "paper.figures_extended_submission_contract",
+        "submit_paper_figures_extended.slurm",
+        (
+            "--mem=64G",
+            f"--mail-user={EMAIL}",
+            "git pull --ff-only origin codex/tube_v1",
+            "build_paper_figures_extended.py",
+            "paper_figures_extended/${WINDOW}",
+            "OPENBLAS_NUM_THREADS=1",
+        ),
+    ))
+    ext_submit = _text(root, "submit_paper_figures_extended.slurm")
+    results.append(_result(
+        "paper.figures_extended_cpu_only_submission",
+        "--gres=gpu" not in ext_submit
+        and "module load cuda" not in ext_submit
+        and "--partition=hpg-b200" not in ext_submit,
+        "Extended paper figure builder is CPU-only and does not request B200 GPUs",
+    ))
+
     results.append(_result(
         "s2s.mixed_control_perturbed_grib_contract",
         all(token in ens_ingest for token in (
