@@ -475,6 +475,26 @@ def test_paper_evidence_blocks_are_cpu_only_and_cover_required_sections():
     assert "build_paper_evidence_blocks.py" in script
 
 
+def test_paper_figures_tables_package_is_cpu_only_and_records_claim_boundaries():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "build_paper_figures_tables.py").read_text(encoding="utf-8")
+    script = (root / "submit_paper_figures_tables.slurm").read_text(encoding="utf-8")
+    assert "figure_1_headline_skill" in source
+    assert "figure_2_headline_stack_minus_ens_ci" in source
+    assert "figure_3_robustness" in source
+    assert "figure_4_opportunity_and_driver_tests" in source
+    assert "methods_text_draft.md" in source
+    assert "narrative_and_claim_boundaries.md" in source
+    assert "investigation_record.md" in source
+    assert "reproducibility_manifest.json" in source
+    assert "Do not say HeatCast alone beats ENS." in source
+    assert "--gres=gpu" not in script
+    assert "module load cuda" not in script
+    assert "--partition=hpg-b200" not in script
+    assert "--mem=32G" in script
+    assert "build_paper_figures_tables.py" in script
+
+
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():
     source = (Path(__file__).resolve().parents[1] / "download_ecmwf_s2s.py").read_text(
         encoding="utf-8"

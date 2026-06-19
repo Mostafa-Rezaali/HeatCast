@@ -309,6 +309,47 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Paper evidence block builder is CPU-only and does not request B200 GPUs",
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "paper.figures_tables_contract",
+        "build_paper_figures_tables.py",
+        (
+            "figure_1_headline_skill",
+            "figure_2_headline_stack_minus_ens_ci",
+            "figure_3_robustness",
+            "figure_4_opportunity_and_driver_tests",
+            "methods_text_draft.md",
+            "narrative_and_claim_boundaries.md",
+            "investigation_record.md",
+            "reproducibility_manifest.json",
+            "table_1_headline_model_metrics.csv",
+            "table_6_operational_metrics.csv",
+            "Do not say HeatCast alone beats ENS.",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "paper.figures_tables_submission_contract",
+        "submit_paper_figures_tables.slurm",
+        (
+            "--mem=32G",
+            f"--mail-user={EMAIL}",
+            "git pull --ff-only origin codex/tube_v1",
+            "build_paper_figures_tables.py",
+            "paper_figures_tables/${WINDOW}",
+            "OPENBLAS_NUM_THREADS=1",
+        ),
+    ))
+    fig_submit = _text(root, "submit_paper_figures_tables.slurm")
+    results.append(_result(
+        "paper.figures_tables_cpu_only_submission",
+        "--gres=gpu" not in fig_submit
+        and "module load cuda" not in fig_submit
+        and "--partition=hpg-b200" not in fig_submit,
+        "Paper figure/table builder is CPU-only and does not request B200 GPUs",
+    ))
+
     results.append(_result(
         "s2s.mixed_control_perturbed_grib_contract",
         all(token in ens_ingest for token in (
@@ -468,6 +509,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "submit_ens_score_compare.slurm",
         "submit_ens_widen_cycles.slurm",
         "submit_slow_driver_opportunity.slurm",
+        "submit_paper_figures_tables.slurm",
     ):
         text = _text(root, relative)
         results.append(_result(
