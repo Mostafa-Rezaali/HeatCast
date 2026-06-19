@@ -46,7 +46,7 @@ STACK_FEATURE_NAMES = (
     "heatcast_sigma",
 )
 SUBSETS = ("all", "heatcast_top10_confidence", "heatcast_low_sigma_tercile", "heatcast_top10_and_low_sigma")
-DRIVER_AXES = ("mjo_phase", "enso_state", "soil_moisture_tercile")
+BASE_DRIVER_AXES = ("mjo_phase", "enso_state", "soil_moisture_tercile")
 DRIVER_PARENT_SELECTIONS = {
     "top_confidence": "heatcast_top10_confidence",
     "low_sigma": "heatcast_low_sigma_tercile",
@@ -181,6 +181,21 @@ def split_driver_key(key: str) -> Tuple[str, str]:
     return axis, stratum
 
 
+def base_driver_axis(axis: str) -> str:
+    return str(axis).split("_x_", 1)[0]
+
+
+def driver_family(axis: str) -> str:
+    base = base_driver_axis(axis)
+    if base in BASE_DRIVER_AXES:
+        return "base_driver"
+    if base.startswith("tele_"):
+        return "generic_teleconnection"
+    if base.startswith("alldata_"):
+        return "alldata"
+    return "other_driver"
+
+
 def driver_interaction_parent_pairs(keys: Iterable[str]) -> List[Tuple[str, str, str, str]]:
     """Return driver interaction child/parent pairs for paired Stack-vs-ENS tests."""
     key_set = set(str(key) for key in keys)
@@ -189,7 +204,7 @@ def driver_interaction_parent_pairs(keys: Iterable[str]) -> List[Tuple[str, str,
         axis, stratum = split_driver_key(key)
         if "__" not in stratum or "_x_" not in axis:
             continue
-        driver_axis = axis.split("_x_", 1)[0]
+        driver_axis = base_driver_axis(axis)
         driver_stratum = stratum.split("__", 1)[0]
         driver_parent = driver_key(driver_axis, driver_stratum)
         if axis.endswith("_x_top_confidence"):
@@ -286,9 +301,11 @@ def bootstrap_parent_delta_rows(
         output.append({
             "interaction_axis": child_axis,
             "interaction_stratum": child_stratum,
+            "interaction_family": driver_family(child_axis),
             "parent_kind": parent_kind,
             "parent_axis": parent_axis,
             "parent_stratum": parent_stratum,
+            "parent_family": driver_family(parent_axis) if "::" in parent_label else "opportunity_selection",
             "candidate_model": candidate,
             "baseline_model": baseline,
             "metric": f"delta_{metric}_stack_vs_ens_child_minus_parent",
@@ -332,7 +349,7 @@ def summarize_driver_accumulators(
     for key, acc in sorted(accumulators.items()):
         axis, stratum = split_driver_key(key)
         for row in acc.summary_rows(REFERENCE):
-            rows.append({"axis": axis, "stratum": stratum, **row})
+            rows.append({"axis": axis, "stratum": stratum, "driver_family": driver_family(axis), **row})
     return rows
 
 
@@ -1083,23 +1100,34 @@ def main() -> None:
     driver_parent_rows: List[Dict[str, object]] = []
     driver_items = sorted(driver_year_acc.items())
     if driver_items:
-        print(f"Running paired driver Stack-vs-ENS bootstraps: strata={len(driver_items)}, reps={stratum_reps}")
+        family_counts: Dict[str, int] = defaultdict(int)
+        for key, _ in driver_items:
+            axis, _stratum = split_driver_key(key)
+            family_counts[driver_family(axis)] += 1
+        family_text = ", ".join(f"{name}={count}" for name, count in sorted(family_counts.items()))
+        print(
+            f"Running paired driver Stack-vs-ENS bootstraps: strata={len(driver_items)}, "
+            f"families=({family_text}), reps={stratum_reps}"
+        )
     for driver_index, (key, key_by_year) in enumerate(driver_items, start=1):
         key_years = sorted({year for _, year in key_by_year})
         if len(key_years) >= 2:
             axis, stratum = split_driver_key(key)
             print(f"  driver bootstrap {driver_index}/{len(driver_items)} {axis}:{stratum}, years={len(key_years)}")
-            driver_bootstrap_rows.extend(
-                bootstrap_delta_rows(
-                    key_by_year,
-                    key_years,
-                    (HEATCAST_MODEL, STACK_MODEL),
-                    ENS_MODEL,
-                    stratum_reps,
-                    int(args.seed) + 3000 + len(driver_bootstrap_rows),
-                    f"{axis}:{stratum}",
-                )
+            rows_one = bootstrap_delta_rows(
+                key_by_year,
+                key_years,
+                (HEATCAST_MODEL, STACK_MODEL),
+                ENS_MODEL,
+                stratum_reps,
+                int(args.seed) + 3000 + len(driver_bootstrap_rows),
+                f"{axis}:{stratum}",
             )
+            for row in rows_one:
+                row["axis"] = axis
+                row["stratum"] = stratum
+                row["driver_family"] = driver_family(axis)
+            driver_bootstrap_rows.extend(rows_one)
     parent_pairs = driver_interaction_parent_pairs(driver_year_acc)
     if parent_pairs:
         print(f"Running paired driver parent-comparison bootstraps: pairs={len(parent_pairs)}, reps={stratum_reps}")
@@ -1219,11 +1247,31 @@ def main() -> None:
     if driver_acc:
         print("\nPaired driver-stratified Stack-vs-ENS tests")
         print("===========================================")
+        family_counts: Dict[str, int] = defaultdict(int)
+        for key in driver_acc:
+            axis, _stratum = split_driver_key(key)
+            family_counts[driver_family(axis)] += 1
+        print(
+            "  driver families: "
+            + ", ".join(f"{name}={count}" for name, count in sorted(family_counts.items()))
+        )
         print(
             f"  wrote {len(driver_acc)} driver/intersection strata, "
             f"{len(driver_bootstrap_rows)} Stack-vs-ENS bootstrap rows, "
             f"{len(driver_parent_rows)} parent-comparison rows."
         )
+        stack_bss_rows = [
+            row for row in driver_bootstrap_rows
+            if row.get("candidate_model") == STACK_MODEL and str(row.get("metric", "")).startswith("delta_bss")
+        ]
+        stack_bss_rows.sort(key=lambda row: float(row["point_estimate"]), reverse=True)
+        for row in stack_bss_rows[:8]:
+            print(
+                f"  top paired driver {row['driver_family']} {row['axis']}:{row['stratum']} "
+                f"Stack-vs-ENS delta_BSS={row['point_estimate']:+.4f} "
+                f"CI=[{row['ci_low']:+.4f},{row['ci_high']:+.4f}], "
+                f"excludes_zero={row['ci_excludes_zero']}"
+            )
         required = {
             ("mjo_phase_x_top_confidence", "phase_8__top_10pct_ge_p90", "selection_parent_top_confidence"),
             ("mjo_phase_x_top_confidence", "phase_8__top_10pct_ge_p90", "driver_parent"),

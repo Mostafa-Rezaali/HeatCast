@@ -19,8 +19,14 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 FOLD_WORKERS=${FOLD_WORKERS:-5}
 STRATUM_BOOTSTRAP_REPS=${STRATUM_BOOTSTRAP_REPS:-1000}
+DRIVER_TABLE_DIR=${DRIVER_TABLE_DIR:-data_cache/slow_driver_tables_w34_alldata}
 DRIVER_ARGS=()
 if [ -n "${DRIVER_TABLE_DIR:-}" ]; then
+  if [ ! -f "$DRIVER_TABLE_DIR/mjo_enso_by_init.npz" ]; then
+    echo "Missing driver table: $DRIVER_TABLE_DIR/mjo_enso_by_init.npz"
+    echo "Build it first with submit_slow_driver_opportunity.slurm using ALLDATA_PATH and/or TELECONNECTION_INDEX_PATHS."
+    exit 1
+  fi
   DRIVER_ARGS=(--driver_table_dir "$DRIVER_TABLE_DIR")
 fi
 
@@ -30,7 +36,7 @@ WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
 cd "$WORK_DIR"
 git pull --ff-only origin codex/tube_v1
 
-"$PY" -m py_compile ens_heatcast_stack_opportunity.py ens_compare.py exceedance_eval.py stitch_exceedance_folds.py
+"$PY" -m py_compile ens_heatcast_stack_opportunity.py ens_compare.py exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
 "$PY" repo_integrity.py
 
 "$PY" -u ens_heatcast_stack_opportunity.py \

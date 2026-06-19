@@ -448,6 +448,9 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     assert "driver_pair_bootstrap.csv" in source
     assert "driver_pair_parent_bootstrap.csv" in source
     assert "Paired driver-stratified Stack-vs-ENS tests" in source
+    assert "generic_teleconnection" in source
+    assert "alldata" in source
+    assert "driver_family" in source
     assert "--mem=500G" in script
     assert "--gres=gpu" not in script
     assert "module load cuda" not in script
@@ -457,6 +460,8 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     assert "FOLD_WORKERS=${FOLD_WORKERS:-5}" in script
     assert "DRIVER_ARGS=()" in script
     assert "DRIVER_TABLE_DIR" in script
+    assert "data_cache/slow_driver_tables_w34_alldata" in script
+    assert "Missing driver table" in script
     assert '--fold_workers "$FOLD_WORKERS"' in script
     assert "OMP_NUM_THREADS=1" in script
 

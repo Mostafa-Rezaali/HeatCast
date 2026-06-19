@@ -244,6 +244,9 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "driver_pair_bootstrap.csv",
             "driver_pair_parent_bootstrap.csv",
             "Paired driver-stratified Stack-vs-ENS tests",
+            "generic_teleconnection",
+            "driver_family",
+            "alldata",
             "Cross-fit assert: PASS",
         ),
     ))
@@ -263,6 +266,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "FOLD_WORKERS=${FOLD_WORKERS:-5}",
             "DRIVER_ARGS=()",
             "DRIVER_TABLE_DIR",
+            "data_cache/slow_driver_tables_w34_alldata",
+            "Missing driver table",
             '--fold_workers "$FOLD_WORKERS"',
             "OMP_NUM_THREADS=1",
         ),
