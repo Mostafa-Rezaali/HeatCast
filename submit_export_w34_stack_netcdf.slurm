@@ -36,6 +36,7 @@ git pull --ff-only origin codex/tube_v1
   --sort_by target \
   --fold_workers 5 \
   --max_stack_samples_per_fold 300000 \
+  --require_continuous_fields \
   --progress_every 50
 
 echo "W34 STACK NETCDF EXPORT COMPLETE: $OUT"

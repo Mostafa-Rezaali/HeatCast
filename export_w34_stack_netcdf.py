@@ -6,12 +6,13 @@ cross-fitted HeatCast+ENS stacker used in the paper analysis, aligns HeatCast
 and ENS by init_time_index, sorts samples chronologically, and writes one
 NetCDF file with dimensions:
 
-  sample x land_cell
+  (y, x, time)
 
 The exported product is the paired W34 HeatCast/ENS held-out test intersection
 because the stack requires ENS chunks. It does not rerun the neural network and
 does not fabricate train/validation stack probabilities when saved chunks are
-not available.
+not available. All map variables are written as 3-D matrices with time as the
+third dimension so MATLAB reads them as [y, x, time].
 """
 
 from __future__ import annotations
@@ -90,6 +91,15 @@ def load_land_metadata() -> Dict[str, np.ndarray]:
 def finite_or_fill(values: np.ndarray, fill_value: float) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float32)
     return np.where(np.isfinite(arr), arr, np.float32(fill_value)).astype(np.float32)
+
+
+def land_vector_to_grid(values: np.ndarray, land_mask: np.ndarray, fill_value: float) -> np.ndarray:
+    grid = np.full(land_mask.shape, np.float32(fill_value), dtype=np.float32)
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if arr.size != int(np.sum(land_mask)):
+        raise RuntimeError(f"Land vector length {arr.size} does not match land mask count {int(np.sum(land_mask))}.")
+    grid[land_mask] = finite_or_fill(arr, fill_value)
+    return grid
 
 
 def build_fold_inputs(args: argparse.Namespace, window_leads: Sequence[int]) -> Dict[int, Dict[str, object]]:
@@ -253,7 +263,7 @@ def write_netcdf(
     variables = set(parse_csv_list(args.variables))
 
     with Dataset(path, "w", format="NETCDF4") as ds:
-        ds.createDimension("sample", sample_count)
+        ds.createDimension("time", sample_count)
         ds.createDimension("land_cell", land_count)
         ds.createDimension("y", int(np.asarray(land_meta["mask"]).shape[0]))
         ds.createDimension("x", int(np.asarray(land_meta["mask"]).shape[1]))
@@ -264,7 +274,11 @@ def write_netcdf(
         ds.scope = "paired_heatcast_ens_heldout_test_intersection"
         ds.note = (
             "The HeatCast+ENS stack is available only where saved HeatCast and ENS chunks "
-            "share init_time_index. split_code is 2 for held-out test samples in this export."
+            "share init_time_index. split_code is 2 for held-out test samples in this export. "
+            "All forecast/truth variables use dimensions (y, x, time) for MATLAB plotting. "
+            "model_output_3d and ground_truth_3d are continuous W34 mean z-score fields "
+            "when source chunks contain mu_z/truth_z; otherwise they are NaN and the "
+            "probability/binary exceedance variables remain available."
         )
         ds.window_leads = args.window_leads
         ds.sort_by = args.sort_by
@@ -283,10 +297,13 @@ def write_netcdf(
         ds.created_utc = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
         create_var(ds, "window_lead", "i4", ("window_lead",), long_name="forecast lead offsets in days")[:] = np.asarray(ee.parse_int_list(args.window_leads), dtype=np.int32)
-        create_var(ds, "lat", "f4", ("land_cell",), units="degrees_north")[:] = land_meta["lat_land"]
-        create_var(ds, "lon", "f4", ("land_cell",), units="degrees_east")[:] = land_meta["lon_land"]
-        create_var(ds, "row", "i4", ("land_cell",), long_name="row index in full CONUS grid")[:] = land_meta["row_land"]
-        create_var(ds, "col", "i4", ("land_cell",), long_name="column index in full CONUS grid")[:] = land_meta["col_land"]
+        lon2d, lat2d = np.meshgrid(np.asarray(land_meta["lon_1d"], dtype=np.float32), np.asarray(land_meta["lat_1d"], dtype=np.float32))
+        create_var(ds, "lat", "f4", ("y", "x"), units="degrees_north")[:] = lat2d
+        create_var(ds, "lon", "f4", ("y", "x"), units="degrees_east")[:] = lon2d
+        create_var(ds, "lat_land", "f4", ("land_cell",), units="degrees_north")[:] = land_meta["lat_land"]
+        create_var(ds, "lon_land", "f4", ("land_cell",), units="degrees_east")[:] = land_meta["lon_land"]
+        create_var(ds, "row_land", "i4", ("land_cell",), long_name="row index in full CONUS grid")[:] = land_meta["row_land"]
+        create_var(ds, "col_land", "i4", ("land_cell",), long_name="column index in full CONUS grid")[:] = land_meta["col_land"]
         create_var(ds, "lat_1d", "f4", ("y",), units="degrees_north")[:] = land_meta["lat_1d"]
         create_var(ds, "lon_1d", "f4", ("x",), units="degrees_east")[:] = land_meta["lon_1d"]
         create_var(ds, "land_mask", "i1", ("y", "x"), zlib=True, long_name="CONUS land mask")[:] = np.asarray(land_meta["mask"], dtype=np.int8)
@@ -295,7 +312,7 @@ def write_netcdf(
             ds,
             "time",
             "f8",
-            ("sample",),
+            ("time",),
             zlib=False,
             units="days since 1981-05-01 00:00:00",
             calendar="standard",
@@ -305,26 +322,32 @@ def write_netcdf(
             ds,
             "init_time",
             "f8",
-            ("sample",),
+            ("time",),
             zlib=False,
             units="days since 1981-05-01 00:00:00",
             calendar="standard",
             long_name="forecast initialization date",
         )
-        target_index_var = create_var(ds, "target_center_time_index", "i4", ("sample",), zlib=False)
-        init_index_var = create_var(ds, "init_time_index", "i4", ("sample",), zlib=False)
-        target_date_var = create_var(ds, "target_date_yyyymmdd", "i4", ("sample",), zlib=False)
-        init_date_var = create_var(ds, "init_date_yyyymmdd", "i4", ("sample",), zlib=False)
-        fold_var = create_var(ds, "source_fold", "i2", ("sample",), zlib=False)
-        split_var = create_var(ds, "split_code", "i1", ("sample",), zlib=False)
+        target_index_var = create_var(ds, "target_center_time_index", "i4", ("time",), zlib=False)
+        init_index_var = create_var(ds, "init_time_index", "i4", ("time",), zlib=False)
+        target_date_var = create_var(ds, "target_date_yyyymmdd", "i4", ("time",), zlib=False)
+        init_date_var = create_var(ds, "init_date_yyyymmdd", "i4", ("time",), zlib=False)
+        fold_var = create_var(ds, "source_fold", "i2", ("time",), zlib=False)
+        split_var = create_var(ds, "split_code", "i1", ("time",), zlib=False)
         split_var.flag_values = "0,1,2"
         split_var.flag_meanings = "train validation test"
-        year_var = create_var(ds, "year", "i2", ("sample",), zlib=False)
-        month_var = create_var(ds, "month", "i1", ("sample",), zlib=False)
+        year_var = create_var(ds, "year", "i2", ("time",), zlib=False)
+        month_var = create_var(ds, "month", "i1", ("time",), zlib=False)
 
-        sample_chunks = (chunk_samples, min(65536, land_count))
+        map_chunks = (
+            int(np.asarray(land_meta["mask"]).shape[0]),
+            min(256, int(np.asarray(land_meta["mask"]).shape[1])),
+            chunk_samples,
+        )
         out_vars = {}
         variable_specs = {
+            "model_output": ("model_output_3d", "Continuous HeatCast W34 mean prediction in z-score units", "z-score"),
+            "ground_truth": ("ground_truth_3d", "Continuous observed W34 mean truth in z-score units", "z-score"),
             "truth": ("truth_exceedance", "Observed W34 window exceedance label", "1"),
             "stack": ("prob_heatcast_ens_stack", "Cross-fitted HeatCast+ENS stack exceedance probability", "1"),
             "heatcast": ("prob_heatcast_C", "HeatCast-C calibrated exceedance probability", "1"),
@@ -342,17 +365,23 @@ def write_netcdf(
                 ds,
                 var_name,
                 "f4",
-                ("sample", "land_cell"),
+                ("y", "x", "time"),
                 fill_value=fill,
                 zlib=True,
                 complevel=int(args.compression_level),
-                chunksizes=sample_chunks,
+                chunksizes=map_chunks,
                 long_name=long_name,
                 units=units,
             )
 
         for idx, record in enumerate(records):
             data = record["data"]
+            if bool(args.require_continuous_fields) and ("mu_z" not in data or "truth_z" not in data):
+                raise RuntimeError(
+                    "Saved incremental chunks do not contain continuous mu_z/truth_z fields. "
+                    "Rerun exceedance_eval.py with --incremental_skill_diagnostic --save_incremental_arrays "
+                    "after pulling the schema>=2 code."
+                )
             stack_prob = record["stacker"].predict_features(np.asarray(data["features"], dtype=np.float32))
             init_idx = int(record["init_time_index"])
             target_idx = int(record["target_center_time_index"])
@@ -370,6 +399,14 @@ def write_netcdf(
             month_var[idx] = int(data["month"])
 
             arrays = {
+                "model_output": np.asarray(
+                    data["mu_z"] if "mu_z" in data else np.full_like(data["truth"], np.nan, dtype=np.float32),
+                    dtype=np.float32,
+                ),
+                "ground_truth": np.asarray(
+                    data["truth_z"] if "truth_z" in data else np.full_like(data["truth"], np.nan, dtype=np.float32),
+                    dtype=np.float32,
+                ),
                 "truth": np.asarray(data["truth"], dtype=np.float32),
                 "stack": np.asarray(stack_prob, dtype=np.float32),
                 "heatcast": np.asarray(data["heatcast_C"], dtype=np.float32),
@@ -381,7 +418,7 @@ def write_netcdf(
                 "forecast_margin": np.asarray(data["features"][:, 4], dtype=np.float32),
             }
             for key, var in out_vars.items():
-                var[idx, :] = finite_or_fill(arrays[key], fill)
+                var[:, :, idx] = land_vector_to_grid(arrays[key], np.asarray(land_meta["mask"], dtype=bool), fill)
             if (idx + 1) % max(1, int(args.progress_every)) == 0:
                 print(f"  wrote {idx + 1}/{sample_count} samples")
 
@@ -398,8 +435,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sort_by", choices=("target", "init"), default="target")
     parser.add_argument(
         "--variables",
-        default="truth,stack,heatcast,ens,ens_raw,base,sigma,init_margin,forecast_margin",
-        help="Comma-separated export fields. Available: truth,stack,heatcast,ens,ens_raw,base,sigma,init_margin,forecast_margin.",
+        default="model_output,ground_truth,truth,stack,heatcast,ens,ens_raw,base,sigma,init_margin,forecast_margin",
+        help="Comma-separated export fields. Available: model_output,ground_truth,truth,stack,heatcast,ens,ens_raw,base,sigma,init_margin,forecast_margin.",
     )
     parser.add_argument("--max_stack_samples_per_fold", type=int, default=300000)
     parser.add_argument("--fold_workers", type=int, default=5)
@@ -410,7 +447,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress_every", type=int, default=50)
     parser.add_argument("--chunk_samples", type=int, default=1)
     parser.add_argument("--compression_level", type=int, default=4)
-    parser.add_argument("--fill_value", type=float, default=-9999.0)
+    parser.add_argument("--fill_value", type=float, default=float("nan"))
+    parser.add_argument(
+        "--require_continuous_fields",
+        action="store_true",
+        help="Fail if saved chunks do not contain continuous mu_z/truth_z fields.",
+    )
     return parser.parse_args()
 
 
@@ -429,7 +471,11 @@ def main() -> None:
     )
     write_netcdf(Path(args.output), records, fold_inputs, time_values, land_meta, args)
     print(f"NetCDF export complete: {args.output}")
-    print("MATLAB variables: prob_heatcast_ens_stack, truth_exceedance, prob_heatcast_C, prob_ens_calibrated, lat, lon, time.")
+    print(
+        "MATLAB variables are y x time cubes: prob_heatcast_ens_stack, "
+        "model_output_3d, ground_truth_3d, truth_exceedance, prob_heatcast_C, prob_ens_calibrated. "
+        "Use lat/lon as y x grids and time as the third dimension coordinate."
+    )
 
 
 if __name__ == "__main__":

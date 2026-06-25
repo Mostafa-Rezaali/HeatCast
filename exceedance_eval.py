@@ -2160,6 +2160,8 @@ def save_incremental_test_chunk(
     truth: np.ndarray,
     base_rate: np.ndarray,
     mask: np.ndarray,
+    mu_z: Optional[np.ndarray] = None,
+    truth_z: Optional[np.ndarray] = None,
     init_time_index: Optional[int] = None,
     target_center_time_index: Optional[int] = None,
 ) -> int:
@@ -2177,6 +2179,16 @@ def save_incremental_test_chunk(
         if model_sigma is not None
         else np.full(int(np.sum(valid)), np.nan, dtype=np.float32)
     )
+    mu_z_saved = (
+        np.asarray(mu_z, dtype=np.float32)[valid]
+        if mu_z is not None
+        else np.full(int(np.sum(valid)), np.nan, dtype=np.float32)
+    )
+    truth_z_saved = (
+        np.asarray(truth_z, dtype=np.float32)[valid]
+        if truth_z is not None
+        else np.full(int(np.sum(valid)), np.nan, dtype=np.float32)
+    )
     path = chunk_dir / f"sample_{int(sample_index):05d}.npz"
     np.savez_compressed(
         path,
@@ -2184,6 +2196,8 @@ def save_incremental_test_chunk(
         forecast_margin=np.asarray(forecast_margin[valid], dtype=np.float32),
         model_sigma=sigma,
         truth=np.asarray(truth[valid] > 0.5, dtype=np.uint8),
+        mu_z=mu_z_saved,
+        truth_z=truth_z_saved,
         base_rate=np.asarray(base_rate[valid], dtype=np.float32),
         year=np.array(int(target_year), dtype=np.int16),
         month=np.array(int(target_month), dtype=np.int8),
@@ -2226,7 +2240,8 @@ def save_incremental_array_manifest(
         eval_split=np.array(str(eval_split)),
         sample_count=np.array(int(sample_count), dtype=np.int32),
         valid_cell_count=np.array(int(valid_cell_count), dtype=np.int64),
-        schema_version=np.array(1, dtype=np.int16),
+        schema_version=np.array(2, dtype=np.int16),
+        schema_note=np.array("test_chunks include binary truth plus continuous mu_z/truth_z fields when exported by exceedance_eval.py schema>=2"),
     )
     return path
 
@@ -3177,6 +3192,8 @@ def evaluate(args: argparse.Namespace) -> None:
                         truth,
                         monthly_climo,
                         mask_np,
+                        mu_z=mu_z,
+                        truth_z=truth_z,
                         init_time_index=t,
                         target_center_time_index=target_t,
                     )
