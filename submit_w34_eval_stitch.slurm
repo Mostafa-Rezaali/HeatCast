@@ -22,6 +22,7 @@ INPUT_ROOT=exceedance_eval_incremental
 CHECKPOINT_CHOICE_FILE=${CHECKPOINT_CHOICE_FILE:-w34_checkpoint_choice.txt}
 CHECKPOINT_OVERRIDE=${CHECKPOINT_OVERRIDE:-}
 DRIVER_DIR=${DRIVER_DIR:-data_cache/slow_driver_tables_w34}
+FORCE_EVAL=${FORCE_EVAL:-0}
 
 cd "$WORK_DIR"
 module load cuda/12.9.1
@@ -47,8 +48,57 @@ case "$CHECKPOINT" in
 esac
 echo "Locked W34 evaluation checkpoint selector: $CHECKPOINT"
 
+fold_outputs_complete() {
+    local run_name="$1"
+    local fold="$2"
+    local window_label="${LEADS//,/-}"
+    local array_dir="$INPUT_ROOT/$run_name/test/window_$window_label/incremental_arrays"
+    if [ "$FORCE_EVAL" = "1" ]; then
+        return 1
+    fi
+    "$PY" - "$array_dir" "$run_name" "$fold" "$LEADS" <<'PY'
+import sys
+from pathlib import Path
+import numpy as np
+
+array_dir = Path(sys.argv[1])
+run_name = sys.argv[2]
+fold = int(sys.argv[3])
+leads = np.array([int(v) for v in sys.argv[4].split(",")], dtype=np.int16)
+manifest_path = array_dir / "manifest.npz"
+chunk_dir = array_dir / "test_chunks"
+if not manifest_path.exists() or not chunk_dir.exists():
+    raise SystemExit(1)
+with np.load(manifest_path, allow_pickle=False) as m:
+    if str(m["run_name"]) != run_name:
+        raise SystemExit(1)
+    if int(m["source_fold"]) != fold:
+        raise SystemExit(1)
+    schema_version = int(m["schema_version"]) if "schema_version" in m.files else 1
+    if schema_version < 2:
+        raise SystemExit(1)
+    if not np.array_equal(np.asarray(m["window_leads"], dtype=np.int16), leads):
+        raise SystemExit(1)
+    sample_count = int(m["sample_count"])
+chunks = sorted(chunk_dir.glob("sample_*.npz"))
+if len(chunks) != sample_count or sample_count <= 0:
+    raise SystemExit(1)
+for path in (chunks[0], chunks[-1]):
+    with np.load(path, allow_pickle=False) as c:
+        if "mu_z" not in c.files or "truth_z" not in c.files:
+            raise SystemExit(1)
+        if c["mu_z"].size == 0 or c["truth_z"].size == 0:
+            raise SystemExit(1)
+print(f"Complete schema-v2 incremental arrays found: {array_dir}")
+PY
+}
+
 for FOLD in 0 1 2 3 4; do
     RUN=cvfold${FOLD}_w34_dist_v1
+    if fold_outputs_complete "$RUN" "$FOLD"; then
+        echo "Skipping fold $FOLD: existing schema-v2 incremental arrays are complete."
+        continue
+    fi
     echo "Evaluating fold $FOLD: $RUN"
     "$PY" -u exceedance_eval.py \
       --run_name "$RUN" \
