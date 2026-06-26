@@ -19,6 +19,7 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   'Basemap'      : MATLAB basemap name. Default: 'grayland'
 %   'MapPointStride': Geographic basemap point stride. Default: 3
 %   'MapMarkerSize': Geographic basemap marker size. Default: 5
+%   'ProbabilityDisplayThreshold': Hide lower probabilities on basemap. Default: 0.05
 %   'VideoProfile' : VideoWriter profile. Default: auto MP4, fallback AVI
 %
 % The script reads one time slice at a time. Output arrays are displayed as
@@ -46,6 +47,7 @@ addParameter(p, 'UseBasemap', true, @(x) islogical(x) || (isnumeric(x) && isscal
 addParameter(p, 'Basemap', 'grayland', @(x) ischar(x) || isstring(x));
 addParameter(p, 'MapPointStride', 3, @(x) isnumeric(x) && isscalar(x) && x >= 1);
 addParameter(p, 'MapMarkerSize', 5, @(x) isnumeric(x) && isscalar(x) && x > 0);
+addParameter(p, 'ProbabilityDisplayThreshold', 0.05, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
 addParameter(p, 'VideoProfile', 'auto', @(x) ischar(x) || isstring(x));
 parse(p, varargin{:});
 opt = p.Results;
@@ -157,8 +159,10 @@ for t = startIndex:frameStep:endIndex
     hindcast = orientFieldToGrid(lat, lon, hindcast);
 
     if useBasemap
-        set(hTruth, 'CData', truth(sampleMask));
-        set(hHind, 'CData', hindcast(sampleMask));
+        truthMask = sampleMask.base & displayMaskForBasemap(truth, true, exceedanceMode, opt.ProbabilityDisplayThreshold);
+        hindMask = sampleMask.base & displayMaskForBasemap(hindcast, false, exceedanceMode, opt.ProbabilityDisplayThreshold);
+        hTruth = updateGeoScatter(hTruth, axTruth, latPlot, lonPlot, truth, truthMask, opt.MapMarkerSize);
+        hHind = updateGeoScatter(hHind, axHind, latPlot, lonPlot, hindcast, hindMask, opt.MapMarkerSize);
     else
         set(hTruth, 'CData', truth);
         set(hHind, 'CData', hindcast);
@@ -220,19 +224,22 @@ end
 function [axTruth, axHind, hTruth, hHind, sampleMask] = initializeBasemapPanels( ...
     tl, latPlot, lonPlot, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim)
 stride = max(1, round(opt.MapPointStride));
-sampleMask = false(size(latPlot));
-sampleMask(1:stride:end, 1:stride:end) = true;
-sampleMask = sampleMask & isfinite(latPlot) & isfinite(lonPlot) & (isfinite(truth0) | isfinite(hind0));
-if ~any(sampleMask(:))
+baseMask = false(size(latPlot));
+baseMask(1:stride:end, 1:stride:end) = true;
+baseMask = baseMask & isfinite(latPlot) & isfinite(lonPlot);
+sampleMask = struct();
+sampleMask.base = baseMask;
+if ~any(baseMask(:))
     error('No finite map points available for geographic basemap plotting.');
 end
+truthMask = baseMask & displayMaskForBasemap(truth0, true, exceedanceMode, opt.ProbabilityDisplayThreshold);
+hindMask = baseMask & displayMaskForBasemap(hind0, false, exceedanceMode, opt.ProbabilityDisplayThreshold);
 
 axTruth = geoaxes(tl);
 axTruth.Layout.Tile = 1;
 applyBasemap(axTruth, char(opt.Basemap));
 geolimits(axTruth, latLim, lonLim);
-hTruth = geoscatter(axTruth, latPlot(sampleMask), lonPlot(sampleMask), ...
-    opt.MapMarkerSize, truth0(sampleMask), 'filled');
+hTruth = makeGeoScatter(axTruth, latPlot, lonPlot, truth0, truthMask, opt.MapMarkerSize);
 setScatterAlpha(hTruth);
 caxis(axTruth, opt.CLim);
 colorbar(axTruth);
@@ -242,17 +249,57 @@ axHind = geoaxes(tl);
 axHind.Layout.Tile = 2;
 applyBasemap(axHind, char(opt.Basemap));
 geolimits(axHind, latLim, lonLim);
-hHind = geoscatter(axHind, latPlot(sampleMask), lonPlot(sampleMask), ...
-    opt.MapMarkerSize, hind0(sampleMask), 'filled');
+hHind = makeGeoScatter(axHind, latPlot, lonPlot, hind0, hindMask, opt.MapMarkerSize);
 setScatterAlpha(hHind);
 caxis(axHind, opt.CLim);
 colorbar(axHind);
 title(axHind, initialHindcastTitle(exceedanceMode, hindcastVar));
 end
 
+function mask = displayMaskForBasemap(field, isTruth, exceedanceMode, probabilityDisplayThreshold)
+mask = isfinite(field);
+if exceedanceMode && isTruth
+    mask = mask & field > 0.5;
+elseif exceedanceMode
+    mask = mask & field >= probabilityDisplayThreshold;
+end
+end
+
+function h = makeGeoScatter(ax, latGrid, lonGrid, field, mask, markerSize)
+[latVals, lonVals, values] = maskedMapVectors(latGrid, lonGrid, field, mask);
+h = geoscatter(ax, latVals, lonVals, markerSize, values, 'filled');
+setScatterAlpha(h);
+end
+
+function h = updateGeoScatter(h, ax, latGrid, lonGrid, field, mask, markerSize)
+[latVals, lonVals, values] = maskedMapVectors(latGrid, lonGrid, field, mask);
+try
+    set(h, 'LatitudeData', latVals, 'LongitudeData', lonVals, 'CData', values, 'SizeData', markerSize);
+catch
+    try
+        delete(h);
+    catch
+    end
+    h = geoscatter(ax, latVals, lonVals, markerSize, values, 'filled');
+    setScatterAlpha(h);
+end
+end
+
+function [latVals, lonVals, values] = maskedMapVectors(latGrid, lonGrid, field, mask)
+if any(mask(:))
+    latVals = latGrid(mask);
+    lonVals = lonGrid(mask);
+    values = field(mask);
+else
+    latVals = NaN;
+    lonVals = NaN;
+    values = NaN;
+end
+end
+
 function setScatterAlpha(h)
 try
-    h.MarkerFaceAlpha = 0.82;
+    h.MarkerFaceAlpha = 0.72;
     h.MarkerEdgeAlpha = 0.0;
 catch
 end
