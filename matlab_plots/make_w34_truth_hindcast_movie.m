@@ -15,6 +15,10 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   'BaseVar'      : Climatology probability variable for BSS. Default: 'prob_climatology'
 %   'EventThreshold' : Probability threshold for hit/FAR. Default: 0.5
 %   'ReliabilityBins': Number of reliability bins. Default: 10
+%   'UseBasemap'   : Use MATLAB geographic axes basemap if available. Default: true
+%   'Basemap'      : MATLAB basemap name. Default: 'grayland'
+%   'MapPointStride': Geographic basemap point stride. Default: 3
+%   'MapMarkerSize': Geographic basemap marker size. Default: 5
 %   'VideoProfile' : VideoWriter profile. Default: auto MP4, fallback AVI
 %
 % The script reads one time slice at a time. Output arrays are displayed as
@@ -38,6 +42,10 @@ addParameter(p, 'HindcastVar', 'model_output_3d', @(x) ischar(x) || isstring(x))
 addParameter(p, 'BaseVar', 'prob_climatology', @(x) ischar(x) || isstring(x));
 addParameter(p, 'EventThreshold', 0.5, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
 addParameter(p, 'ReliabilityBins', 10, @(x) isnumeric(x) && isscalar(x) && x >= 2);
+addParameter(p, 'UseBasemap', true, @(x) islogical(x) || (isnumeric(x) && isscalar(x)));
+addParameter(p, 'Basemap', 'grayland', @(x) ischar(x) || isstring(x));
+addParameter(p, 'MapPointStride', 3, @(x) isnumeric(x) && isscalar(x) && x >= 1);
+addParameter(p, 'MapMarkerSize', 5, @(x) isnumeric(x) && isscalar(x) && x > 0);
 addParameter(p, 'VideoProfile', 'auto', @(x) ischar(x) || isstring(x));
 parse(p, varargin{:});
 opt = p.Results;
@@ -110,35 +118,27 @@ fig = figure('Color', 'w', 'Position', [100 100 1600 720]);
 tl = tiledlayout(fig, 1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
 colormap(fig, blueWhiteRed(256));
 
-axTruth = nexttile(tl, 1);
-hTruth = surface(axTruth, lonPlot, latPlot, zeros(size(truth0)), truth0, 'EdgeColor', 'none');
-view(axTruth, 2);
-set(axTruth, 'YDir', 'normal');
-axis(axTruth, 'equal', 'tight');
-xlim(axTruth, lonLim);
-ylim(axTruth, latLim);
-enableMapGrid(axTruth);
-caxis(axTruth, opt.CLim);
-colorbar(axTruth);
-title(axTruth, initialTruthTitle(exceedanceMode));
-xlabel(axTruth, 'Longitude');
-ylabel(axTruth, 'Latitude');
-setSurfaceAlpha(hTruth, truth0);
-
-axHind = nexttile(tl, 2);
-hHind = surface(axHind, lonPlot, latPlot, zeros(size(hind0)), hind0, 'EdgeColor', 'none');
-view(axHind, 2);
-set(axHind, 'YDir', 'normal');
-axis(axHind, 'equal', 'tight');
-xlim(axHind, lonLim);
-ylim(axHind, latLim);
-enableMapGrid(axHind);
-caxis(axHind, opt.CLim);
-colorbar(axHind);
-title(axHind, initialHindcastTitle(exceedanceMode, hindcastVar));
-xlabel(axHind, 'Longitude');
-ylabel(axHind, 'Latitude');
-setSurfaceAlpha(hHind, hind0);
+useBasemap = logical(opt.UseBasemap);
+sampleMask = [];
+try
+    if useBasemap
+        [axTruth, axHind, hTruth, hHind, sampleMask] = initializeBasemapPanels( ...
+            tl, latPlot, lonPlot, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim);
+    else
+        error('Basemap disabled by UseBasemap=false.');
+    end
+catch err
+    if useBasemap
+        warning('Basemap plotting unavailable (%s). Falling back to native lat/lon surface axes.', err.message);
+        try
+            delete(findall(fig, 'Type', 'geoaxes'));
+        catch
+        end
+    end
+    useBasemap = false;
+    [axTruth, axHind, hTruth, hHind] = initializeSurfacePanels( ...
+        tl, latPlot, lonPlot, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim);
+end
 
 for t = startIndex:frameStep:endIndex
     truth = readMatchedTimeSlice(ncFile, truthVar, t, nt, lat, lon, truthTimeDim);
@@ -152,10 +152,15 @@ for t = startIndex:frameStep:endIndex
     truth = orientFieldToGrid(lat, lon, truth);
     hindcast = orientFieldToGrid(lat, lon, hindcast);
 
-    set(hTruth, 'CData', truth);
-    set(hHind, 'CData', hindcast);
-    setSurfaceAlpha(hTruth, truth);
-    setSurfaceAlpha(hHind, hindcast);
+    if useBasemap
+        set(hTruth, 'CData', truth(sampleMask));
+        set(hHind, 'CData', hindcast(sampleMask));
+    else
+        set(hTruth, 'CData', truth);
+        set(hHind, 'CData', hindcast);
+        setSurfaceAlpha(hTruth, truth);
+        setSurfaceAlpha(hHind, hindcast);
+    end
 
     [windowText, initText, centerText] = windowDateText(targetDate(t), initDate, t, windowLeads);
     if exceedanceMode
@@ -206,6 +211,91 @@ ax.GridAlpha = 0.35;
 ax.Layer = 'top';
 xticks(ax, -130:10:-60);
 yticks(ax, 25:5:50);
+end
+
+function [axTruth, axHind, hTruth, hHind, sampleMask] = initializeBasemapPanels( ...
+    tl, latPlot, lonPlot, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim)
+stride = max(1, round(opt.MapPointStride));
+sampleMask = false(size(latPlot));
+sampleMask(1:stride:end, 1:stride:end) = true;
+sampleMask = sampleMask & isfinite(latPlot) & isfinite(lonPlot) & (isfinite(truth0) | isfinite(hind0));
+if ~any(sampleMask(:))
+    error('No finite map points available for geographic basemap plotting.');
+end
+
+axTruth = geoaxes(tl);
+axTruth.Layout.Tile = 1;
+applyBasemap(axTruth, char(opt.Basemap));
+geolimits(axTruth, latLim, lonLim);
+hTruth = geoscatter(axTruth, latPlot(sampleMask), lonPlot(sampleMask), ...
+    opt.MapMarkerSize, truth0(sampleMask), 'filled');
+setScatterAlpha(hTruth);
+caxis(axTruth, opt.CLim);
+colorbar(axTruth);
+title(axTruth, initialTruthTitle(exceedanceMode));
+
+axHind = geoaxes(tl);
+axHind.Layout.Tile = 2;
+applyBasemap(axHind, char(opt.Basemap));
+geolimits(axHind, latLim, lonLim);
+hHind = geoscatter(axHind, latPlot(sampleMask), lonPlot(sampleMask), ...
+    opt.MapMarkerSize, hind0(sampleMask), 'filled');
+setScatterAlpha(hHind);
+caxis(axHind, opt.CLim);
+colorbar(axHind);
+title(axHind, initialHindcastTitle(exceedanceMode, hindcastVar));
+end
+
+function setScatterAlpha(h)
+try
+    h.MarkerFaceAlpha = 0.82;
+    h.MarkerEdgeAlpha = 0.0;
+catch
+end
+end
+
+function applyBasemap(ax, requestedBasemap)
+try
+    geobasemap(ax, requestedBasemap);
+catch
+    geobasemap(ax, 'darkwater');
+end
+end
+
+function [axTruth, axHind, hTruth, hHind] = initializeSurfacePanels( ...
+    tl, latPlot, lonPlot, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim)
+lonLim = [min(lonPlot(:), [], 'omitnan'), max(lonPlot(:), [], 'omitnan')];
+latLim = [min(latPlot(:), [], 'omitnan'), max(latPlot(:), [], 'omitnan')];
+
+axTruth = nexttile(tl, 1);
+hTruth = surface(axTruth, lonPlot, latPlot, zeros(size(truth0)), truth0, 'EdgeColor', 'none');
+view(axTruth, 2);
+set(axTruth, 'YDir', 'normal');
+axis(axTruth, 'equal', 'tight');
+xlim(axTruth, lonLim);
+ylim(axTruth, latLim);
+enableMapGrid(axTruth);
+caxis(axTruth, opt.CLim);
+colorbar(axTruth);
+title(axTruth, initialTruthTitle(exceedanceMode));
+xlabel(axTruth, 'Longitude');
+ylabel(axTruth, 'Latitude');
+setSurfaceAlpha(hTruth, truth0);
+
+axHind = nexttile(tl, 2);
+hHind = surface(axHind, lonPlot, latPlot, zeros(size(hind0)), hind0, 'EdgeColor', 'none');
+view(axHind, 2);
+set(axHind, 'YDir', 'normal');
+axis(axHind, 'equal', 'tight');
+xlim(axHind, lonLim);
+ylim(axHind, latLim);
+enableMapGrid(axHind);
+caxis(axHind, opt.CLim);
+colorbar(axHind);
+title(axHind, initialHindcastTitle(exceedanceMode, hindcastVar));
+xlabel(axHind, 'Longitude');
+ylabel(axHind, 'Latitude');
+setSurfaceAlpha(hHind, hind0);
 end
 
 function tf = isExceedanceMovie(truthVar, hindcastVar)
