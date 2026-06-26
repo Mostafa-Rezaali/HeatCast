@@ -37,7 +37,6 @@ from ens_heatcast_stack_opportunity import (
     fit_heatcast_c,
     paired_chunk,
 )
-from publication_analysis_utils import conus_lat_lon
 from stitch_exceedance_folds import load_fold_inputs
 
 
@@ -48,6 +47,10 @@ HEATCAST_RUNS_DEFAULT = (
     "cvfold3_w34_dist_v1,cvfold4_w34_dist_v1"
 )
 ENS_RUNS_DEFAULT = "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024"
+PRISM_SHAPE = (621, 1405)
+PRISM_CELL_DEG = 1.0 / 24.0
+PRISM_LON_LEFT_CENTER = -125.0
+PRISM_LAT_BOTTOM_CENTER = 24.0833333333333
 
 
 def parse_csv_list(text: str) -> Tuple[str, ...]:
@@ -71,14 +74,73 @@ def load_time_values(path: Path) -> np.ndarray:
     return values
 
 
+def prism_pixel_center_lat_lon(shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return PRISM 4 km pixel-center coordinates for the standard CONUS grid."""
+    h, w = shape
+    if (h, w) != PRISM_SHAPE:
+        raise RuntimeError(
+            f"PRISM pixel-center fallback is defined only for shape={PRISM_SHAPE}, got {(h, w)}. "
+            "Add real coordinate variables to the source NetCDF for this grid."
+        )
+    lon_1d = PRISM_LON_LEFT_CENTER + np.arange(w, dtype=np.float32) * np.float32(PRISM_CELL_DEG)
+    lat_1d_south_to_north = PRISM_LAT_BOTTOM_CENTER + np.arange(h, dtype=np.float32) * np.float32(PRISM_CELL_DEG)
+    lat_1d = lat_1d_south_to_north[::-1].astype(np.float32)
+    lon2d, lat2d = np.meshgrid(lon_1d.astype(np.float32), lat_1d)
+    return lat_1d, lon_1d.astype(np.float32), lat2d.astype(np.float32), lon2d.astype(np.float32)
+
+
+def _coord_from_source(path: Path, shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Read lat/lon coordinates from the target source file when they are present."""
+    if not path.exists():
+        return None
+    try:
+        from netCDF4 import Dataset
+    except Exception:
+        return None
+    lat_names = ("lat", "latitude", "y")
+    lon_names = ("lon", "longitude", "x")
+    try:
+        with Dataset(path, "r") as ds:
+            lat = next((np.asarray(ds.variables[name][:], dtype=np.float32) for name in lat_names if name in ds.variables), None)
+            lon = next((np.asarray(ds.variables[name][:], dtype=np.float32) for name in lon_names if name in ds.variables), None)
+    except Exception:
+        return None
+    if lat is None or lon is None:
+        return None
+    if lat.ndim == 1 and lon.ndim == 1:
+        if lat.size == shape[0] and lon.size == shape[1]:
+            lon2d, lat2d = np.meshgrid(lon, lat)
+            return lat.astype(np.float32), lon.astype(np.float32), lat2d.astype(np.float32), lon2d.astype(np.float32)
+        if lat.size == shape[1] and lon.size == shape[0]:
+            lon2d, lat2d = np.meshgrid(lat, lon)
+            return lon.astype(np.float32), lat.astype(np.float32), lat2d.astype(np.float32), lon2d.astype(np.float32)
+    if lat.ndim == 2 and lon.ndim == 2:
+        if lat.shape == shape and lon.shape == shape:
+            return lat[:, 0].astype(np.float32), lon[0, :].astype(np.float32), lat.astype(np.float32), lon.astype(np.float32)
+        if lat.T.shape == shape and lon.T.shape == shape:
+            lat2d = lat.T.astype(np.float32)
+            lon2d = lon.T.astype(np.float32)
+            return lat2d[:, 0].astype(np.float32), lon2d[0, :].astype(np.float32), lat2d, lon2d
+    return None
+
+
+def target_lat_lon(config, shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
+    coords = _coord_from_source(Path(config.TRAINING_DATA_PATH), shape)
+    if coords is not None:
+        return (*coords, f"source:{config.TRAINING_DATA_PATH}")
+    lat_1d, lon_1d, lat2d, lon2d = prism_pixel_center_lat_lon(shape)
+    return lat_1d, lon_1d, lat2d, lon2d, "prism_4km_pixel_center_fallback"
+
+
 def load_land_metadata() -> Dict[str, np.ndarray]:
     import cfm_mesh_train as cfm
 
     mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
-    lat_1d, lon_1d, lat2d, lon2d = conus_lat_lon(mask.shape)
+    lat_1d, lon_1d, lat2d, lon2d, coord_source = target_lat_lon(cfm.Config, mask.shape)
     row2d, col2d = np.indices(mask.shape)
     return {
         "mask": mask,
+        "coord_source": coord_source,
         "lat_1d": np.asarray(lat_1d, dtype=np.float32),
         "lon_1d": np.asarray(lon_1d, dtype=np.float32),
         "lat_land": np.asarray(lat2d[mask], dtype=np.float32),
@@ -299,6 +361,7 @@ def write_netcdf(
         ds.sort_by = args.sort_by
         ds.heatcast_runs = args.heatcast_runs
         ds.ens_runs = args.ens_runs
+        ds.coordinate_source = str(land_meta.get("coord_source", "unknown"))
         ds.stack_feature_names = ",".join(STACK_FEATURE_NAMES)
         ds.fold_manifests_json = json.dumps({
             int(fold): {

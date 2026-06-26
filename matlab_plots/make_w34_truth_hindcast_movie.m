@@ -240,6 +240,7 @@ if hasVariable(ncFile, 'lat_1d') && hasVariable(ncFile, 'lon_1d')
         error('Displayed field must be 2-D, got size %s.', mat2str(fieldSize));
     end
     if isequal(sort([numel(lat1), numel(lon1)]), sort(fieldSize))
+        [lat1, lon1] = correctedAxisVectors(lat1, lon1, fieldSize);
         [lonPlot, latPlot] = meshgrid(lon1, lat1);
         return;
     end
@@ -247,6 +248,37 @@ if hasVariable(ncFile, 'lat_1d') && hasVariable(ncFile, 'lon_1d')
         numel(lat1), numel(lon1), mat2str(fieldSize));
 end
 [latPlot, lonPlot] = orientGridToField(lat2d, lon2d, field);
+end
+
+function [lat1, lon1] = correctedAxisVectors(lat1, lon1, fieldSize)
+% Older exports used the model's broad mesh extent (-130..-60, 25..50)
+% as if it were the PRISM pixel-center grid. That stretches the CONUS mask
+% on geographic basemaps. For the standard 621x1405 PRISM grid, replace
+% those stale axes with PRISM 4 km pixel-center coordinates.
+if isequal(sort(fieldSize), [621 1405])
+    staleLon = min(lon1) < -126 || max(lon1) > -65;
+    staleLat = min(lat1) > 24.2 || max(lat1) > 49.95;
+    if staleLon || staleLat
+        if numel(lat1) == fieldSize(1) && numel(lon1) == fieldSize(2)
+            [lat1, lon1] = prismAxisVectors(numel(lat1), numel(lon1));
+        elseif numel(lat1) == fieldSize(2) && numel(lon1) == fieldSize(1)
+            [tmpLat, tmpLon] = prismAxisVectors(numel(lon1), numel(lat1));
+            lat1 = tmpLon;
+            lon1 = tmpLat;
+        end
+    end
+end
+end
+
+function [lat1, lon1] = prismAxisVectors(nLat, nLon)
+% PRISM CONUS 4 km grid, pixel centers, for nLat=621 and nLon=1405.
+cellDeg = 1.0 / 24.0;
+lonLeft = -125.0;
+latBottom = 24.0833333333333;
+lon1 = lonLeft + (0:(nLon - 1)) * cellDeg;
+lat1 = latBottom + ((nLat - 1):-1:0) * cellDeg;
+lat1 = double(lat1(:));
+lon1 = double(lon1(:));
 end
 
 function displayMask = readDisplayMask(ncFile, lat, lon, conusBounds)
