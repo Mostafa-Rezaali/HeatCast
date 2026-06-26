@@ -83,7 +83,7 @@ with np.load(manifest_path, allow_pickle=False) as m:
 chunks = sorted(chunk_dir.glob("sample_*.npz"))
 if len(chunks) != sample_count or sample_count <= 0:
     raise SystemExit(1)
-for path in (chunks[0], chunks[-1]):
+for path in chunks:
     with np.load(path, allow_pickle=False) as c:
         if "mu_z" not in c.files or "truth_z" not in c.files:
             raise SystemExit(1)

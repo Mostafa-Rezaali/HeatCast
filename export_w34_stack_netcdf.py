@@ -378,7 +378,9 @@ def write_netcdf(
             data = record["data"]
             if bool(args.require_continuous_fields) and ("mu_z" not in data or "truth_z" not in data):
                 raise RuntimeError(
-                    "Saved incremental chunks do not contain continuous mu_z/truth_z fields. "
+                    f"Saved incremental chunk lacks continuous mu_z/truth_z fields "
+                    f"(fold={record['fold']}, init_time_index={record['init_time_index']}, "
+                    f"target_center_time_index={record['target_center_time_index']}). "
                     "Rerun exceedance_eval.py with --incremental_skill_diagnostic --save_incremental_arrays "
                     "after pulling the schema>=2 code."
                 )
