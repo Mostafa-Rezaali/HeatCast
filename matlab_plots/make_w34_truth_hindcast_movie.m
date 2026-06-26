@@ -66,7 +66,8 @@ end
 % ncread dimension order can differ from the y,x,time wording used in Python.
 [truth0, truthTimeDim] = readMatchedTimeSlice(ncFile, truthVar, startIndex, nt, lat, lon, []);
 [hind0, hindTimeDim] = readMatchedTimeSlice(ncFile, hindcastVar, startIndex, nt, lat, lon, truthTimeDim);
-[latPlot, lonPlot] = orientGridToField(lat, lon, truth0);
+[truth0, latPlot, lonPlot] = orientFieldToGrid(lat, lon, truth0);
+hind0 = orientFieldToGrid(lat, lon, hind0);
 
 lonLim = [min(lonPlot(:), [], 'omitnan'), max(lonPlot(:), [], 'omitnan')];
 latLim = [min(latPlot(:), [], 'omitnan'), max(latPlot(:), [], 'omitnan')];
@@ -89,33 +90,43 @@ tl = tiledlayout(fig, 1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
 colormap(fig, blueWhiteRed(256));
 
 axTruth = nexttile(tl, 1);
-hTruth = imagesc(axTruth, lonLim, latLim, truth0);
+hTruth = surface(axTruth, lonPlot, latPlot, zeros(size(truth0)), truth0, 'EdgeColor', 'none');
+view(axTruth, 2);
 set(axTruth, 'YDir', 'normal');
-axis(axTruth, 'image');
+axis(axTruth, 'equal', 'tight');
+xlim(axTruth, lonLim);
+ylim(axTruth, latLim);
 caxis(axTruth, opt.CLim);
 colorbar(axTruth);
 title(axTruth, 'Observed W34 truth');
 xlabel(axTruth, 'Longitude');
 ylabel(axTruth, 'Latitude');
-set(hTruth, 'AlphaData', isfinite(truth0));
+setSurfaceAlpha(hTruth, truth0);
 
 axHind = nexttile(tl, 2);
-hHind = imagesc(axHind, lonLim, latLim, hind0);
+hHind = surface(axHind, lonPlot, latPlot, zeros(size(hind0)), hind0, 'EdgeColor', 'none');
+view(axHind, 2);
 set(axHind, 'YDir', 'normal');
-axis(axHind, 'image');
+axis(axHind, 'equal', 'tight');
+xlim(axHind, lonLim);
+ylim(axHind, latLim);
 caxis(axHind, opt.CLim);
 colorbar(axHind);
 title(axHind, 'HeatCast W34 hindcast');
 xlabel(axHind, 'Longitude');
 ylabel(axHind, 'Latitude');
-set(hHind, 'AlphaData', isfinite(hind0));
+setSurfaceAlpha(hHind, hind0);
 
 for t = startIndex:frameStep:endIndex
     truth = readMatchedTimeSlice(ncFile, truthVar, t, nt, lat, lon, truthTimeDim);
     hindcast = readMatchedTimeSlice(ncFile, hindcastVar, t, nt, lat, lon, hindTimeDim);
+    truth = orientFieldToGrid(lat, lon, truth);
+    hindcast = orientFieldToGrid(lat, lon, hindcast);
 
-    set(hTruth, 'CData', truth, 'AlphaData', isfinite(truth));
-    set(hHind, 'CData', hindcast, 'AlphaData', isfinite(hindcast));
+    set(hTruth, 'CData', truth);
+    set(hHind, 'CData', hindcast);
+    setSurfaceAlpha(hTruth, truth);
+    setSurfaceAlpha(hHind, hindcast);
 
     dateText = dateLabel(targetDate(t));
     title(axTruth, sprintf('Observed W34 truth | %s', dateText));
@@ -259,6 +270,24 @@ end
 function ok = isGridCompatible(field, lat, lon)
 ok = (isequal(size(field), size(lat)) && isequal(size(field), size(lon))) || ...
      (isequal(size(field), size(lat')) && isequal(size(field), size(lon')));
+end
+
+function [fieldOut, latOut, lonOut] = orientFieldToGrid(lat, lon, field)
+% Return field in the same orientation as the native lat/lon grid.
+if isequal(size(field), size(lat)) && isequal(size(field), size(lon))
+    fieldOut = field;
+elseif isequal(size(field'), size(lat)) && isequal(size(field'), size(lon))
+    fieldOut = field';
+else
+    error('field size %s does not match lat/lon size %s or its transpose.', mat2str(size(field)), mat2str(size(lat)));
+end
+latOut = lat;
+lonOut = lon;
+end
+
+function setSurfaceAlpha(h, field)
+% Hide ocean/unavailable NaNs while keeping valid grid cells opaque.
+set(h, 'AlphaData', double(isfinite(field)), 'FaceAlpha', 'flat', 'AlphaDataMapping', 'none');
 end
 
 function [latOut, lonOut] = orientGridToField(lat, lon, field)
