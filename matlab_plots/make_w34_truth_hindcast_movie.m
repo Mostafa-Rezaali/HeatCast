@@ -120,7 +120,8 @@ end
 open(writer);
 cleanupObj = onCleanup(@() close(writer));
 
-fig = figure('Color', 'w', 'Position', [100 100 1600 720]);
+movieSize = [720 1600]; % [height width], fixed for VideoWriter.
+fig = figure('Color', 'w', 'Units', 'pixels', 'Position', [100 100 movieSize(2) movieSize(1)], 'Resize', 'off');
 tl = tiledlayout(fig, 1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
 if exceedanceMode
     colormap(fig, probabilityWhiteRed(256));
@@ -197,11 +198,32 @@ for t = startIndex:frameStep:endIndex
     end
 
     drawnow;
-    writeVideo(writer, getframe(fig));
+    frame = fixedSizeFrame(getframe(fig), movieSize);
+    writeVideo(writer, frame);
 end
 
 fprintf('Wrote movie: %s\n', outMovie);
 
+end
+
+function frameOut = fixedSizeFrame(frameIn, targetSize)
+% VideoWriter requires every frame to have the exact first-frame size.
+% MATLAB can return frames that differ by a pixel when axes/toolbars redraw.
+targetH = targetSize(1);
+targetW = targetSize(2);
+cdata = frameIn.cdata;
+[h, w, c] = size(cdata);
+if h == targetH && w == targetW
+    frameOut = frameIn;
+    return;
+end
+frame = uint8(255 * ones(targetH, targetW, c));
+copyH = min(h, targetH);
+copyW = min(w, targetW);
+frame(1:copyH, 1:copyW, :) = cdata(1:copyH, 1:copyW, :);
+frameOut = frameIn;
+frameOut.cdata = frame;
+frameOut.colormap = [];
 end
 
 function values = readOptionalVector(ncFile, varName)
