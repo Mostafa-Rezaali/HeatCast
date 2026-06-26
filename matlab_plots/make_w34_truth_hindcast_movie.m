@@ -12,6 +12,9 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   'CLim'         : color limits for z-score fields. Default: [-2.5 2.5]
 %   'TruthVar'     : NetCDF truth variable. Default: 'ground_truth_3d'
 %   'HindcastVar'  : NetCDF hindcast variable. Default: 'model_output_3d'
+%   'BaseVar'      : Climatology probability variable for BSS. Default: 'prob_climatology'
+%   'EventThreshold' : Probability threshold for hit/FAR. Default: 0.5
+%   'ReliabilityBins': Number of reliability bins. Default: 10
 %   'VideoProfile' : VideoWriter profile. Default: auto MP4, fallback AVI
 %
 % The script reads one time slice at a time. Output arrays are displayed as
@@ -32,6 +35,9 @@ addParameter(p, 'EndIndex', [], @(x) isempty(x) || (isnumeric(x) && isscalar(x) 
 addParameter(p, 'CLim', [-2.5 2.5], @(x) isnumeric(x) && numel(x) == 2);
 addParameter(p, 'TruthVar', 'ground_truth_3d', @(x) ischar(x) || isstring(x));
 addParameter(p, 'HindcastVar', 'model_output_3d', @(x) ischar(x) || isstring(x));
+addParameter(p, 'BaseVar', 'prob_climatology', @(x) ischar(x) || isstring(x));
+addParameter(p, 'EventThreshold', 0.5, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
+addParameter(p, 'ReliabilityBins', 10, @(x) isnumeric(x) && isscalar(x) && x >= 2);
 addParameter(p, 'VideoProfile', 'auto', @(x) ischar(x) || isstring(x));
 parse(p, varargin{:});
 opt = p.Results;
@@ -41,6 +47,12 @@ ncFile = resolveNetcdfPath(ncFile);
 outMovie = char(outMovie);
 truthVar = char(opt.TruthVar);
 hindcastVar = char(opt.HindcastVar);
+baseVar = char(opt.BaseVar);
+exceedanceMode = isExceedanceMovie(truthVar, hindcastVar);
+if exceedanceMode && isequal(opt.CLim, [-2.5 2.5])
+    opt.CLim = [0 1];
+end
+hasBaseField = exceedanceMode && hasVariable(ncFile, baseVar);
 
 time = ncread(ncFile, 'time');
 targetDate = ncread(ncFile, 'target_date_yyyymmdd');
@@ -71,6 +83,10 @@ end
 % ncread dimension order can differ from the y,x,time wording used in Python.
 [truth0, truthTimeDim] = readMatchedTimeSlice(ncFile, truthVar, startIndex, nt, lat, lon, []);
 [hind0, hindTimeDim] = readMatchedTimeSlice(ncFile, hindcastVar, startIndex, nt, lat, lon, truthTimeDim);
+baseTimeDim = [];
+if hasBaseField
+    [base0, baseTimeDim] = readMatchedTimeSlice(ncFile, baseVar, startIndex, nt, lat, lon, truthTimeDim); %#ok<NASGU>
+end
 [truth0, latPlot, lonPlot] = orientFieldToGrid(lat, lon, truth0);
 hind0 = orientFieldToGrid(lat, lon, hind0);
 
@@ -104,7 +120,7 @@ ylim(axTruth, latLim);
 enableMapGrid(axTruth);
 caxis(axTruth, opt.CLim);
 colorbar(axTruth);
-title(axTruth, 'Observed W34 truth');
+title(axTruth, initialTruthTitle(exceedanceMode));
 xlabel(axTruth, 'Longitude');
 ylabel(axTruth, 'Latitude');
 setSurfaceAlpha(hTruth, truth0);
@@ -119,7 +135,7 @@ ylim(axHind, latLim);
 enableMapGrid(axHind);
 caxis(axHind, opt.CLim);
 colorbar(axHind);
-title(axHind, 'HeatCast W34 hindcast');
+title(axHind, initialHindcastTitle(exceedanceMode, hindcastVar));
 xlabel(axHind, 'Longitude');
 ylabel(axHind, 'Latitude');
 setSurfaceAlpha(hHind, hind0);
@@ -127,6 +143,12 @@ setSurfaceAlpha(hHind, hind0);
 for t = startIndex:frameStep:endIndex
     truth = readMatchedTimeSlice(ncFile, truthVar, t, nt, lat, lon, truthTimeDim);
     hindcast = readMatchedTimeSlice(ncFile, hindcastVar, t, nt, lat, lon, hindTimeDim);
+    if hasBaseField
+        base = readMatchedTimeSlice(ncFile, baseVar, t, nt, lat, lon, baseTimeDim);
+        base = orientFieldToGrid(lat, lon, base);
+    else
+        base = [];
+    end
     truth = orientFieldToGrid(lat, lon, truth);
     hindcast = orientFieldToGrid(lat, lon, hindcast);
 
@@ -135,15 +157,25 @@ for t = startIndex:frameStep:endIndex
     setSurfaceAlpha(hTruth, truth);
     setSurfaceAlpha(hHind, hindcast);
 
-    metrics = fieldMetrics(truth, hindcast);
     [windowText, initText, centerText] = windowDateText(targetDate(t), initDate, t, windowLeads);
-    title(axTruth, sprintf('Observed W34 truth | %s', centerText));
-    title(axHind, sprintf('HeatCast W34 hindcast | %s', centerText));
-    sgtitle(tl, sprintf(['W34 continuous z-score fields | %d-day mean over leads +%d..+%d (%s) | ', ...
-        'init %s | frame %d/%d\nMAE=%.3f  RMSE=%.3f  bias=%.3f  r=%.3f  R2=%.3f  N=%s land cells'], ...
-        numel(windowLeads), min(windowLeads), max(windowLeads), windowText, initText, t, nt, ...
-        metrics.mae, metrics.rmse, metrics.bias, metrics.r, metrics.r2, formatInteger(metrics.n)), ...
-        'FontWeight', 'bold');
+    if exceedanceMode
+        metricsText = exceedanceMetricsText(truth, hindcast, base, opt.EventThreshold, round(opt.ReliabilityBins));
+        title(axTruth, sprintf('Observed W34 exceedance label | %s', centerText));
+        title(axHind, sprintf('%s probability | %s', hindcastDisplayName(hindcastVar), centerText));
+        sgtitle(tl, sprintf(['W34 exceedance probability | %d-day mean over leads +%d..+%d (%s) | ', ...
+            'init %s | frame %d/%d\n%s'], ...
+            numel(windowLeads), min(windowLeads), max(windowLeads), windowText, initText, t, nt, metricsText), ...
+            'FontWeight', 'bold');
+    else
+        metrics = fieldMetrics(truth, hindcast);
+        title(axTruth, sprintf('Observed W34 truth | %s', centerText));
+        title(axHind, sprintf('HeatCast W34 hindcast | %s', centerText));
+        sgtitle(tl, sprintf(['W34 continuous z-score fields | %d-day mean over leads +%d..+%d (%s) | ', ...
+            'init %s | frame %d/%d\nMAE=%.3f  RMSE=%.3f  bias=%.3f  r=%.3f  R2=%.3f  N=%s land cells'], ...
+            numel(windowLeads), min(windowLeads), max(windowLeads), windowText, initText, t, nt, ...
+            metrics.mae, metrics.rmse, metrics.bias, metrics.r, metrics.r2, formatInteger(metrics.n)), ...
+            'FontWeight', 'bold');
+    end
 
     drawnow;
     writeVideo(writer, getframe(fig));
@@ -174,6 +206,139 @@ ax.GridAlpha = 0.35;
 ax.Layer = 'top';
 xticks(ax, -130:10:-60);
 yticks(ax, 25:5:50);
+end
+
+function tf = isExceedanceMovie(truthVar, hindcastVar)
+tf = strcmpi(truthVar, 'truth_exceedance') || startsWith(lower(hindcastVar), 'prob_');
+end
+
+function s = initialTruthTitle(exceedanceMode)
+if exceedanceMode
+    s = 'Observed W34 exceedance label';
+else
+    s = 'Observed W34 truth';
+end
+end
+
+function s = initialHindcastTitle(exceedanceMode, hindcastVar)
+if exceedanceMode
+    s = sprintf('%s probability', hindcastDisplayName(hindcastVar));
+else
+    s = 'HeatCast W34 hindcast';
+end
+end
+
+function s = hindcastDisplayName(hindcastVar)
+switch lower(hindcastVar)
+    case 'prob_heatcast_ens_stack'
+        s = 'HeatCast+ENS stack';
+    case 'prob_heatcast_c'
+        s = 'HeatCast-C';
+    case 'prob_ens_calibrated'
+        s = 'ENS calibrated';
+    case 'prob_ens_raw_fraction'
+        s = 'ENS raw fraction';
+    otherwise
+        s = strrep(hindcastVar, '_', '\_');
+end
+end
+
+function text = exceedanceMetricsText(truth, prob, base, eventThreshold, reliabilityBins)
+metrics = exceedanceMetrics(truth, prob, base, eventThreshold, reliabilityBins);
+if isfinite(metrics.bss)
+    bssText = sprintf('BSS=%.3f', metrics.bss);
+else
+    bssText = 'BSS=NA';
+end
+text = sprintf(['Brier=%.4f  %s  ECE=%.3f  rel_slope=%.3f  hit=%.3f  FAR=%.3f  ', ...
+    'obs=%.3f  mean_p=%.3f  thr=%.2f  N=%s land cells'], ...
+    metrics.brier, bssText, metrics.ece, metrics.slope, metrics.hitRate, metrics.falseAlarmRate, ...
+    metrics.obsRate, metrics.meanProb, eventThreshold, formatInteger(metrics.n));
+end
+
+function metrics = exceedanceMetrics(truth, prob, base, eventThreshold, reliabilityBins)
+valid = isfinite(truth) & isfinite(prob);
+y = double(truth(valid) > 0.5);
+p = min(max(double(prob(valid)), 0), 1);
+metrics.n = numel(y);
+if metrics.n == 0
+    metrics = emptyExceedanceMetrics(metrics.n);
+    return;
+end
+
+metrics.brier = mean((p - y) .^ 2);
+metrics.obsRate = mean(y);
+metrics.meanProb = mean(p);
+
+if ~isempty(base)
+    b = min(max(double(base(valid)), 0), 1);
+    baseValid = isfinite(b);
+    if any(baseValid)
+        baseBrier = mean((b(baseValid) - y(baseValid)) .^ 2);
+        modelBrierForBss = mean((p(baseValid) - y(baseValid)) .^ 2);
+        metrics.bss = 1 - modelBrierForBss / (baseBrier + eps);
+    else
+        metrics.bss = NaN;
+    end
+else
+    metrics.bss = NaN;
+end
+
+predEvent = p >= eventThreshold;
+hits = sum(predEvent & (y == 1));
+misses = sum(~predEvent & (y == 1));
+falseAlarms = sum(predEvent & (y == 0));
+correctNegatives = sum(~predEvent & (y == 0));
+metrics.hitRate = hits / max(hits + misses, 1);
+metrics.falseAlarmRate = falseAlarms / max(falseAlarms + correctNegatives, 1);
+
+[metrics.ece, metrics.slope] = reliabilityMetrics(y, p, reliabilityBins);
+end
+
+function metrics = emptyExceedanceMetrics(n)
+metrics.n = n;
+metrics.brier = NaN;
+metrics.bss = NaN;
+metrics.ece = NaN;
+metrics.slope = NaN;
+metrics.hitRate = NaN;
+metrics.falseAlarmRate = NaN;
+metrics.obsRate = NaN;
+metrics.meanProb = NaN;
+end
+
+function [ece, slope] = reliabilityMetrics(y, p, reliabilityBins)
+edges = linspace(0, 1, reliabilityBins + 1);
+ece = 0;
+binPred = [];
+binObs = [];
+binW = [];
+for i = 1:reliabilityBins
+    if i == reliabilityBins
+        inBin = p >= edges(i) & p <= edges(i + 1);
+    else
+        inBin = p >= edges(i) & p < edges(i + 1);
+    end
+    n = sum(inBin);
+    if n == 0
+        continue;
+    end
+    mp = mean(p(inBin));
+    mo = mean(y(inBin));
+    w = n / numel(y);
+    ece = ece + w * abs(mp - mo);
+    binPred(end + 1, 1) = mp; %#ok<AGROW>
+    binObs(end + 1, 1) = mo; %#ok<AGROW>
+    binW(end + 1, 1) = n; %#ok<AGROW>
+end
+if numel(binPred) >= 2 && std(binPred) > 1e-8
+    x = [ones(size(binPred)), binPred];
+    sw = sqrt(binW);
+    beta = (x .* sw) \ (binObs .* sw);
+    slope = beta(2);
+else
+    slope = NaN;
+end
 end
 
 function metrics = fieldMetrics(truth, pred)
