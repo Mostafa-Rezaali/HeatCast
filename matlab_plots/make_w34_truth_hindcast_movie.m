@@ -44,6 +44,11 @@ hindcastVar = char(opt.HindcastVar);
 
 time = ncread(ncFile, 'time');
 targetDate = ncread(ncFile, 'target_date_yyyymmdd');
+initDate = readOptionalVector(ncFile, 'init_date_yyyymmdd');
+windowLeads = readOptionalVector(ncFile, 'window_lead');
+if isempty(windowLeads)
+    windowLeads = 15:28;
+end
 nt = numel(time);
 if isempty(opt.EndIndex)
     endIndex = nt;
@@ -96,6 +101,7 @@ set(axTruth, 'YDir', 'normal');
 axis(axTruth, 'equal', 'tight');
 xlim(axTruth, lonLim);
 ylim(axTruth, latLim);
+enableMapGrid(axTruth);
 caxis(axTruth, opt.CLim);
 colorbar(axTruth);
 title(axTruth, 'Observed W34 truth');
@@ -110,6 +116,7 @@ set(axHind, 'YDir', 'normal');
 axis(axHind, 'equal', 'tight');
 xlim(axHind, lonLim);
 ylim(axHind, latLim);
+enableMapGrid(axHind);
 caxis(axHind, opt.CLim);
 colorbar(axHind);
 title(axHind, 'HeatCast W34 hindcast');
@@ -128,10 +135,15 @@ for t = startIndex:frameStep:endIndex
     setSurfaceAlpha(hTruth, truth);
     setSurfaceAlpha(hHind, hindcast);
 
-    dateText = dateLabel(targetDate(t));
-    title(axTruth, sprintf('Observed W34 truth | %s', dateText));
-    title(axHind, sprintf('HeatCast W34 hindcast | %s', dateText));
-    sgtitle(tl, sprintf('W34 continuous z-score fields | frame %d of %d', t, nt), 'FontWeight', 'bold');
+    metrics = fieldMetrics(truth, hindcast);
+    [windowText, initText, centerText] = windowDateText(targetDate(t), initDate, t, windowLeads);
+    title(axTruth, sprintf('Observed W34 truth | %s', centerText));
+    title(axHind, sprintf('HeatCast W34 hindcast | %s', centerText));
+    sgtitle(tl, sprintf(['W34 continuous z-score fields | %d-day mean over leads +%d..+%d (%s) | ', ...
+        'init %s | frame %d/%d\nMAE=%.3f  RMSE=%.3f  bias=%.3f  r=%.3f  R2=%.3f  N=%s land cells'], ...
+        numel(windowLeads), min(windowLeads), max(windowLeads), windowText, initText, t, nt, ...
+        metrics.mae, metrics.rmse, metrics.bias, metrics.r, metrics.r2, formatInteger(metrics.n)), ...
+        'FontWeight', 'bold');
 
     drawnow;
     writeVideo(writer, getframe(fig));
@@ -139,6 +151,92 @@ end
 
 fprintf('Wrote movie: %s\n', outMovie);
 
+end
+
+function values = readOptionalVector(ncFile, varName)
+if hasVariable(ncFile, varName)
+    values = ncread(ncFile, varName);
+else
+    values = [];
+end
+end
+
+function tf = hasVariable(ncFile, varName)
+info = ncinfo(ncFile);
+names = {info.Variables.Name};
+tf = any(strcmp(names, varName));
+end
+
+function enableMapGrid(ax)
+grid(ax, 'on');
+ax.GridColor = [0.25 0.25 0.25];
+ax.GridAlpha = 0.35;
+ax.Layer = 'top';
+xticks(ax, -130:10:-60);
+yticks(ax, 25:5:50);
+end
+
+function metrics = fieldMetrics(truth, pred)
+valid = isfinite(truth) & isfinite(pred);
+t = double(truth(valid));
+p = double(pred(valid));
+metrics.n = numel(t);
+if metrics.n == 0
+    metrics.mae = NaN;
+    metrics.rmse = NaN;
+    metrics.bias = NaN;
+    metrics.r = NaN;
+    metrics.r2 = NaN;
+    return;
+end
+err = p - t;
+metrics.mae = mean(abs(err));
+metrics.rmse = sqrt(mean(err .^ 2));
+metrics.bias = mean(err);
+sse = sum((t - p) .^ 2);
+sst = sum((t - mean(t)) .^ 2);
+metrics.r2 = 1 - sse / (sst + eps);
+if std(t) > 1e-8 && std(p) > 1e-8
+    c = corrcoef(t, p);
+    metrics.r = c(1, 2);
+else
+    metrics.r = NaN;
+end
+end
+
+function [windowText, initText, centerText] = windowDateText(targetYmd, initDate, frameIndex, windowLeads)
+centerDt = ymdToDatetime(targetYmd);
+centerText = datetimeLabel(centerDt);
+if ~isempty(initDate) && numel(initDate) >= frameIndex && isfinite(double(initDate(frameIndex))) && initDate(frameIndex) > 10000000
+    initDt = ymdToDatetime(initDate(frameIndex));
+    initText = datetimeLabel(initDt);
+    startDt = initDt + days(min(windowLeads));
+    endDt = initDt + days(max(windowLeads));
+else
+    initText = 'unavailable';
+    n = numel(windowLeads);
+    startDt = centerDt - days(floor((n - 1) / 2));
+    endDt = startDt + days(n - 1);
+end
+windowText = sprintf('%s to %s', datetimeLabel(startDt), datetimeLabel(endDt));
+end
+
+function dt = ymdToDatetime(value)
+txt = sprintf('%08d', round(double(value)));
+dt = datetime(str2double(txt(1:4)), str2double(txt(5:6)), str2double(txt(7:8)));
+end
+
+function label = datetimeLabel(dt)
+dt.Format = 'yyyy-MM-dd';
+label = char(dt);
+end
+
+function s = formatInteger(value)
+if ~isfinite(value)
+    s = '0';
+else
+    s = sprintf('%.0f', value);
+end
 end
 
 function [writer, outMovie] = makeVideoWriter(outMovie, requestedProfile)
