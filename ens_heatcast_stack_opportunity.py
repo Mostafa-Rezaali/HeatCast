@@ -460,7 +460,7 @@ def paired_chunk(
     base = np.asarray(heat["base_rate"], dtype=np.float32)
     sigma = np.asarray(heat["model_sigma"], dtype=np.float32)
     features = stack_features(ens_raw, ens_calibrated, heat_prob, heat)
-    return {
+    out = {
         "truth": truth,
         "base": base,
         "ens_raw": ens_raw,
@@ -474,6 +474,10 @@ def paired_chunk(
         "init_time_index": scalar(heat, "init_time_index"),
         "target_center_time_index": scalar(heat, "target_center_time_index"),
     }
+    for key in ("mu_z", "truth_z"):
+        if key in heat:
+            out[key] = np.asarray(heat[key], dtype=np.float32)
+    return out
 
 
 def fit_opportunity_boundaries(calibration: Mapping[str, np.ndarray], heat_c) -> Dict[str, float]:
