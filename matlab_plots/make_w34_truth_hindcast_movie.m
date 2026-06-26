@@ -163,6 +163,8 @@ for t = startIndex:frameStep:endIndex
         hindMask = sampleMask.base & displayMaskForBasemap(hindcast, false, exceedanceMode, opt.ProbabilityDisplayThreshold);
         hTruth = updateGeoScatter(hTruth, axTruth, latPlot, lonPlot, truth, truthMask, opt.MapMarkerSize);
         hHind = updateGeoScatter(hHind, axHind, latPlot, lonPlot, hindcast, hindMask, opt.MapMarkerSize);
+        freezeGeoLimits(axTruth, latLim, lonLim);
+        freezeGeoLimits(axHind, latLim, lonLim);
     else
         set(hTruth, 'CData', truth);
         set(hHind, 'CData', hindcast);
@@ -238,9 +240,10 @@ hindMask = baseMask & displayMaskForBasemap(hind0, false, exceedanceMode, opt.Pr
 axTruth = geoaxes(tl);
 axTruth.Layout.Tile = 1;
 applyBasemap(axTruth, char(opt.Basemap));
-geolimits(axTruth, latLim, lonLim);
+freezeGeoLimits(axTruth, latLim, lonLim);
 hTruth = makeGeoScatter(axTruth, latPlot, lonPlot, truth0, truthMask, opt.MapMarkerSize);
 setScatterAlpha(hTruth);
+freezeGeoLimits(axTruth, latLim, lonLim);
 caxis(axTruth, opt.CLim);
 colorbar(axTruth);
 title(axTruth, initialTruthTitle(exceedanceMode));
@@ -248,12 +251,22 @@ title(axTruth, initialTruthTitle(exceedanceMode));
 axHind = geoaxes(tl);
 axHind.Layout.Tile = 2;
 applyBasemap(axHind, char(opt.Basemap));
-geolimits(axHind, latLim, lonLim);
+freezeGeoLimits(axHind, latLim, lonLim);
 hHind = makeGeoScatter(axHind, latPlot, lonPlot, hind0, hindMask, opt.MapMarkerSize);
 setScatterAlpha(hHind);
+freezeGeoLimits(axHind, latLim, lonLim);
 caxis(axHind, opt.CLim);
 colorbar(axHind);
 title(axHind, initialHindcastTitle(exceedanceMode, hindcastVar));
+end
+
+function freezeGeoLimits(ax, latLim, lonLim)
+geolimits(ax, latLim, lonLim);
+try
+    ax.LatitudeLimitsMode = 'manual';
+    ax.LongitudeLimitsMode = 'manual';
+catch
+end
 end
 
 function mask = displayMaskForBasemap(field, isTruth, exceedanceMode, probabilityDisplayThreshold)
