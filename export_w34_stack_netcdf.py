@@ -176,8 +176,18 @@ def load_fold_norm_scales(
             cfm.Config.PREDICTION_LEADS = leads
             cfm.Config.LEAD_TIME = original["LEAD_TIME"] if original["LEAD_TIME"] in leads else leads[0]
             stats_path = cfm.get_norm_stats_path(cfm.Config)
-            stats = cfm.load_norm_stats_npz(stats_path)
-            out[int(fold)] = (float(stats["hi_mean"]), float(stats["hi_std"]))
+            if not Path(stats_path).exists():
+                raise FileNotFoundError(f"Missing fold normalization stats for degree-C export: {stats_path}")
+            with np.load(stats_path, allow_pickle=False) as stats:
+                if "hi_mean" not in stats or "hi_std" not in stats:
+                    raise RuntimeError(f"Normalization stats lack hi_mean/hi_std: {stats_path}")
+                hi_mean = float(stats["hi_mean"])
+                hi_std = float(stats["hi_std"])
+            if not np.isfinite(hi_mean) or not np.isfinite(hi_std) or hi_std <= 0:
+                raise RuntimeError(
+                    f"Invalid normalization scale in {stats_path}: hi_mean={hi_mean}, hi_std={hi_std}"
+                )
+            out[int(fold)] = (hi_mean, hi_std)
     finally:
         for key, value in original.items():
             setattr(cfm.Config, key, value)
