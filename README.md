@@ -1,5 +1,24 @@
 # HeatCast
 
+[![CI](https://github.com/Mostafa-Rezaali/HeatCast/actions/workflows/python-package.yml/badge.svg?branch=main)](https://github.com/Mostafa-Rezaali/HeatCast/actions/workflows/python-package.yml)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-distributional%20mesh%20GNN-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-12.9.1-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![Slurm](https://img.shields.io/badge/HPC-Slurm-0D73BA)](https://slurm.schedmd.com/)
+[![pytest](https://img.shields.io/badge/tests-pytest%20passing-0A9EDC?logo=pytest&logoColor=white)](https://github.com/Mostafa-Rezaali/HeatCast/actions/workflows/python-package.yml)
+[![Flake8](https://img.shields.io/badge/lint-Flake8%20checked-4C9C39)](https://github.com/Mostafa-Rezaali/HeatCast/actions/workflows/python-package.yml)
+[![Integrity](https://img.shields.io/badge/repository%20integrity-checked-brightgreen)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/repo_integrity.py)
+<br>
+[![Forecast window](https://img.shields.io/badge/W34-leads%20%2B15...%2B28-6A5ACD)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/submit_w34_tube_all.slurm)
+[![Cross-validation](https://img.shields.io/badge/cross--validation-5%20year--disjoint%20folds-2E8B57)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/README.md#exceedance-definition)
+[![Parameters](https://img.shields.io/badge/parameters-4%2C637%2C891-8A2BE2)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/README.md#w34-training-contract)
+[![NetCDF4](https://img.shields.io/badge/output-NetCDF4-4B8BBE)](https://unidata.github.io/netcdf4-python/)
+[![MATLAB](https://img.shields.io/badge/export-MATLAB%20compatible-F7941D?logo=mathworks&logoColor=white)](https://github.com/Mostafa-Rezaali/HeatCast/tree/main/matlab_plots)
+[![Last commit](https://img.shields.io/github/last-commit/Mostafa-Rezaali/HeatCast?branch=main)](https://github.com/Mostafa-Rezaali/HeatCast/commits/main)
+[![Repository size](https://img.shields.io/github/repo-size/Mostafa-Rezaali/HeatCast)](https://github.com/Mostafa-Rezaali/HeatCast)
+[![Stars](https://img.shields.io/github/stars/Mostafa-Rezaali/HeatCast?style=flat)](https://github.com/Mostafa-Rezaali/HeatCast/stargazers)
+[![Open issues](https://img.shields.io/github/issues/Mostafa-Rezaali/HeatCast)](https://github.com/Mostafa-Rezaali/HeatCast/issues)
+
 HeatCast is a GraphCast-style mesh graph neural network for probabilistic
 CONUS week-3--4 (W34) warm-season T2max prediction. The current production
 model is the **HeatCast-W34 Distributional Mesh GNN**:
