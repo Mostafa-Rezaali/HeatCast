@@ -16,7 +16,7 @@
 <br>
 [![Forecast window](https://img.shields.io/badge/W34-leads%20%2B15...%2B28-6A5ACD)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/slurm/submit_w34_tube_all.slurm)
 [![Cross-validation](https://img.shields.io/badge/cross--validation-5%20year--disjoint%20folds-2E8B57)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/README.md#exceedance-definition)
-[![Parameters](https://img.shields.io/badge/parameters-4%2C637%2C891-8A2BE2)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/README.md#w34-training-contract)
+[![Parameters](https://img.shields.io/badge/parameters-4%2C637%2C891-8A2BE2)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/README.md#w34-model-configuration)
 [![NetCDF4](https://img.shields.io/badge/output-NetCDF4-4B8BBE)](https://unidata.github.io/netcdf4-python/)
 [![MATLAB](https://img.shields.io/badge/export-MATLAB%20compatible-F7941D?logo=mathworks&logoColor=white)](https://github.com/Mostafa-Rezaali/HeatCast/tree/main/matlab)
 [![Last commit](https://img.shields.io/github/last-commit/Mostafa-Rezaali/HeatCast?branch=main)](https://github.com/Mostafa-Rezaali/HeatCast/commits/main)
@@ -25,8 +25,8 @@
 [![Open issues](https://img.shields.io/github/issues/Mostafa-Rezaali/HeatCast)](https://github.com/Mostafa-Rezaali/HeatCast/issues)
 
 HeatCast is a GraphCast-style mesh graph neural network for probabilistic
-CONUS week-3--4 (W34) warm-season T2max prediction. The current production
-model is the **HeatCast-W34 Distributional Mesh GNN**:
+CONUS week-3--4 (W34) warm-season T2max prediction. The reference model is the
+**HeatCast-W34 Distributional Mesh GNN**:
 
 - direct, single-pass inference rather than CFM sampling;
 - a 14-lead tube covering `t+15...t+28`;
@@ -35,34 +35,36 @@ model is the **HeatCast-W34 Distributional Mesh GNN**:
 - five-fold, year-disjoint cross-validation; and
 - held-out calibration and evaluation for W34 q95 exceedance probabilities.
 
-The model has 4,637,891 trainable parameters in the executed W34
-configuration. Training data, checkpoints, caches, generated tables, figures,
-movies, and manuscript working files are intentionally excluded from Git.
+The model has 4,637,891 trainable parameters in the reference W34
+configuration. Large datasets and trained checkpoints are not distributed in
+this repository.
 
-## Production Workflow
+## Quick Start
 
-The repository keeps one current Slurm entry point for each production stage.
+Clone the repository and run the data-free verification suite:
 
-| Stage | Submission |
-|---|---|
-| Train all five W34 folds | `slurm/submit_w34_tube_all.slurm` |
-| Evaluate, stitch, and save fold-safe arrays | `slurm/submit_w34_eval_stitch.slurm` |
-| Ingest and score ECMWF S2S cycles | `slurm/submit_ens_widen_cycles.slurm` |
-| Fit the paired HeatCast+ENS stack | `slurm/submit_ens_stack_opportunity.slurm` |
-| Add teleconnection and opportunity analyses | `slurm/submit_teleconnection_stack_analysis.slurm` |
-| Build paper evidence tables | `slurm/submit_paper_evidence_blocks.slurm` |
-| Build all journal figures and tables | `slurm/submit_paper_figures_journal.slurm` |
-| Export MATLAB-readable W34 NetCDF | `slurm/submit_export_w34_stack_netcdf.slurm` |
+```bash
+git clone https://github.com/Mostafa-Rezaali/HeatCast.git
+cd HeatCast
+python src/repo_integrity.py
+python -m pytest -q
+```
 
-`slurm/submit_w34_tube_all.slurm` automatically submits
-`slurm/submit_w34_eval_stitch.slurm` after all folds complete. The evaluation
-defaults to the `best_monitor` checkpoint and accepts `CHECKPOINT_OVERRIDE`
-when an explicit alternative is required.
+On a configured Slurm system, train and evaluate all five W34 folds with:
+
+```bash
+sbatch slurm/submit_w34_tube_all.slurm
+```
+
+The training workflow resumes incomplete folds and submits
+`slurm/submit_w34_eval_stitch.slurm` after training completes. External data
+paths and the Python environment in the Slurm scripts must be configured for
+the target system.
 
 ## Repository Layout
 
 ```text
-src/       Python model, evaluation, ENS, and publication code
+src/       Python model, evaluation, ENS, and analysis code
 slurm/     Current production submission workflows
 tests/     Data-free regression and experiment-contract tests
 docs/      Model-input and integrity-test documentation
@@ -85,17 +87,14 @@ matlab/    MATLAB visualization utilities
 | `src/ens_heatcast_stack_opportunity.py` | Cross-fitted HeatCast+ENS stack and robustness analyses |
 | `src/build_driver_tables.py` | MJO, ENSO, soil, and teleconnection driver tables |
 | `src/forecasts_of_opportunity.py` | Driver/opportunity stratification and paired year bootstrap |
-| `src/build_paper_evidence_blocks.py` | Paper-facing mechanism, robustness, and operational tables |
-| `src/build_paper_figures_tables.py` | Primary probabilistic figures and tables |
-| `src/build_paper_figures_extended.py` | Spatial, reliability, case-study, and supporting figures |
 | `src/export_w34_stack_netcdf.py` | MATLAB NetCDF export with latitude x longitude x time fields |
 | `src/repo_integrity.py` | Fast data-free experiment and submission contract audit |
 
 `docs/MODEL_INPUTS.md` lists the local, vector, and global predictor channels.
 
-## W34 Training Contract
+## W34 Model Configuration
 
-The production training script fixes the executed experiment:
+The reference training configuration is:
 
 ```text
 prediction leads:        15,16,...,28
@@ -108,16 +107,6 @@ cross-validation:        five year-disjoint folds
 
 Despite the historical monitor name `tube_weekly7_tac`, the W34 script passes
 14 leads, so the monitored tube mean is the 14-day mean over `t+15...t+28`.
-
-Run on HiPerGator:
-
-```bash
-cd /blue/nessie/mostafarezaali/Teleconnection
-sbatch slurm/submit_w34_tube_all.slurm
-```
-
-The script requests eight B200 GPUs and 500 GB memory, resumes incomplete
-folds, and skips folds with a completed best-monitor checkpoint.
 
 ## Exceedance Definition
 
@@ -146,19 +135,9 @@ The HeatCast+ENS stack is fit cross-fitted: each scored fold is excluded from
 its stacker fit. Comparisons use identical initialization dates, PRISM truth,
 q95 thresholds, land cells, and calendar-year bootstrap blocks.
 
-## Paper Outputs
+## MATLAB Export
 
-After the matched stack and teleconnection analyses complete:
-
-```bash
-sbatch slurm/submit_paper_evidence_blocks.slurm
-sbatch slurm/submit_paper_figures_journal.slurm
-```
-
-The journal wrapper runs both figure builders and is the only retained figure
-submission entry point. Generated outputs remain untracked.
-
-For MATLAB export:
+Export the matched W34 fields and probabilities to NetCDF with:
 
 ```bash
 sbatch slurm/submit_export_w34_stack_netcdf.slurm
@@ -177,27 +156,18 @@ python -m pytest -q
 ```
 
 The integrity audit checks the W34 lead window, distributional semantics,
-fold-safe evaluation, active Slurm contracts, current submission allowlist,
-ENS cycle handling, paper workflow, and absence of tracked runtime artifacts.
-See `docs/INTEGRITY_TEST_KIT.md` for scope and limitations.
+fold-safe evaluation, active Slurm contracts, ENS cycle handling, and absence
+of tracked runtime artifacts. See `docs/INTEGRITY_TEST_KIT.md` for scope and
+limitations.
 
-## Environment And External Data
+## Data Requirements
 
-Production scripts target UF HiPerGator and use:
+Primary external inputs are configured in `src/cfm_mesh_train.py`. They include
+the PRISM/local training dataset, extended coarse global conditions,
+topography, and fold-specific normalization caches. ECMWF S2S GRIB data and
+teleconnection index sources are required only for the corresponding
+benchmark and driver analyses.
 
-```text
-/blue/nessie/mostafarezaali/Teleconnection
-/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
-CUDA 12.9.1 for model training/evaluation
-```
+## License
 
-Primary external files are configured in `src/cfm_mesh_train.py`, including the
-PRISM/local training dataset, extended coarse global conditions, topography,
-and train-only normalization caches. ECMWF S2S GRIB data and teleconnection
-index sources are also external.
-
-## Repository Policy
-
-Commit source code, tests, active Slurm workflows, and concise documentation.
-Do not commit datasets, checkpoints, caches, generated results, manuscripts,
-meeting/presentation packs, figures, movies, logs, or personal proposal files.
+HeatCast is released under the [MIT License](LICENSE).
