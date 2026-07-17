@@ -95,7 +95,7 @@ def load_ingested_files(root: Path, window_leads: Sequence[int]) -> Dict[int, Pa
         preview = "\n".join(f"  {line}" for line in invalid_files[:100])
         raise RuntimeError(
             f"Found {len(invalid_files)} invalid ingested ENS outputs under {root}:\n{preview}\n"
-            "Rerun submit_ens_ingest.slurm; its resume validator will remove and rebuild them."
+            "Rerun submit_ens_widen_cycles.slurm; its resume validator will remove and rebuild them."
         )
     if missing_leads:
         print("Skipped ingested files that do not contain the requested window:")

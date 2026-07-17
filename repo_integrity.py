@@ -19,6 +19,16 @@ from typing import Iterable
 W34_LEADS = tuple(range(15, 29))
 MJJAS_MONTHS = (5, 6, 7, 8, 9)
 EMAIL = "mostafarezaali@ufl.edu"
+CURRENT_SUBMISSIONS = (
+    "submit_ens_stack_opportunity.slurm",
+    "submit_ens_widen_cycles.slurm",
+    "submit_export_w34_stack_netcdf.slurm",
+    "submit_paper_evidence_blocks.slurm",
+    "submit_paper_figures_journal.slurm",
+    "submit_teleconnection_stack_analysis.slurm",
+    "submit_w34_eval_stitch.slurm",
+    "submit_w34_tube_all.slurm",
+)
 
 
 @dataclass(frozen=True)
@@ -160,6 +170,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "--save_incremental_arrays",
             "--fit_mode cross_fitted",
             "--tube_decode_chunk_size 2",
+            "CHECKPOINT=${CHECKPOINT_OVERRIDE:-best_monitor}",
         ),
     ))
 
@@ -173,52 +184,6 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "driver_parent",
             "driver_interaction_paired_bootstrap.csv",
             "p_holm_mjo",
-        ),
-    ))
-
-    results.append(_required_tokens_check(
-        root,
-        "opportunity.slow_driver_submission_contract",
-        "submit_slow_driver_opportunity.slurm",
-        (
-            "--mem=500G",
-            f"--mail-user={EMAIL}",
-            "--driver_table_dir \"$DRIVER_DIR\"",
-            "TELECONNECTION_INDEX_PATHS",
-            "--teleconnection_index_paths \"$TELECONNECTION_INDEX_PATHS\"",
-            "ALLDATA_PATH",
-            "--alldata_path \"$ALLDATA_PATH\"",
-            "--bootstrap_axes \"$BOOTSTRAP_AXES\"",
-            '"$PY" repo_integrity.py',
-            "OPENBLAS_NUM_THREADS=1",
-        ),
-    ))
-    slow_driver_submit = _text(root, "submit_slow_driver_opportunity.slurm")
-    results.append(_result(
-        "opportunity.slow_driver_cpu_only_submission",
-        "--gres=gpu" not in slow_driver_submit
-        and "module load cuda" not in slow_driver_submit
-        and "--partition=hpg-b200" not in slow_driver_submit,
-        "Slow-driver opportunity analysis is CPU-only and does not request B200 GPUs",
-    ))
-
-    results.append(_required_tokens_check(
-        root,
-        "s2s.ingest_and_compare_contract",
-        "submit_ens_score_compare.slurm",
-        (
-            "--mem=500G",
-            "--gres=gpu:1",
-            f"--mail-user={EMAIL}",
-            "LEADS=15,16,17,18,19,20,21,22,23,24,25,26,27,28",
-            "--bootstrap_reps 5000",
-            '"$PY" repo_integrity.py',
-            "FOLD_WORKERS=${FOLD_WORKERS:-2}",
-            "score_fold()",
-            "wait_for_fold_batch()",
-            'score_fold "$FOLD" &',
-            'if [ "${#PIDS[@]}" -ge "$FOLD_WORKERS" ]; then',
-            "All ENS folds complete; starting pooled comparison",
         ),
     ))
 
@@ -374,28 +339,6 @@ def audit_repository(root: Path) -> list[CheckResult]:
 
     results.append(_required_tokens_check(
         root,
-        "paper.figures_tables_submission_contract",
-        "submit_paper_figures_tables.slurm",
-        (
-            "--mem=32G",
-            f"--mail-user={EMAIL}",
-            "git pull --ff-only origin main",
-            "build_paper_figures_tables.py",
-            "paper_figures_tables/${WINDOW}",
-            "OPENBLAS_NUM_THREADS=1",
-        ),
-    ))
-    fig_submit = _text(root, "submit_paper_figures_tables.slurm")
-    results.append(_result(
-        "paper.figures_tables_cpu_only_submission",
-        "--gres=gpu" not in fig_submit
-        and "module load cuda" not in fig_submit
-        and "--partition=hpg-b200" not in fig_submit,
-        "Paper figure/table builder is CPU-only and does not request B200 GPUs",
-    ))
-
-    results.append(_required_tokens_check(
-        root,
         "paper.figures_extended_contract",
         "build_paper_figures_extended.py",
         (
@@ -415,28 +358,6 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "reproducibility_manifest.json",
             "source_entry",
         ),
-    ))
-
-    results.append(_required_tokens_check(
-        root,
-        "paper.figures_extended_submission_contract",
-        "submit_paper_figures_extended.slurm",
-        (
-            "--mem=64G",
-            f"--mail-user={EMAIL}",
-            "git pull --ff-only origin main",
-            "build_paper_figures_extended.py",
-            "paper_figures_extended/${WINDOW}",
-            "OPENBLAS_NUM_THREADS=1",
-        ),
-    ))
-    ext_submit = _text(root, "submit_paper_figures_extended.slurm")
-    results.append(_result(
-        "paper.figures_extended_cpu_only_submission",
-        "--gres=gpu" not in ext_submit
-        and "module load cuda" not in ext_submit
-        and "--partition=hpg-b200" not in ext_submit,
-        "Extended paper figure builder is CPU-only and does not request B200 GPUs",
     ))
 
     results.append(_required_tokens_check(
@@ -478,7 +399,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "ENS ingestion opens and combines control and perturbed GRIB groups explicitly",
     ))
 
-    ens_ingest_submission = _text(root, "submit_ens_ingest.slurm")
+    ens_ingest_submission = _text(root, "submit_ens_widen_cycles.slurm")
     results.append(_result(
         "s2s.parallel_ingest_contract",
         all(token in ens_ingest for token in (
@@ -523,7 +444,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "s2s.score_rejects_corrupt_ingest_contract",
         "validate_ingested_output(path, window_leads)" in ens_score
         and "Found {len(invalid_files)} invalid ingested ENS outputs" in ens_score
-        and "Rerun submit_ens_ingest.slurm" in ens_score,
+        and "Rerun submit_ens_widen_cycles.slurm" in ens_score,
         "ENS scoring rejects invalid ingested archives with a repair command",
     ))
 
@@ -596,35 +517,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         ),
     ))
 
-    results.append(_required_tokens_check(
-        root,
-        "w34.best_monitor_head_to_head_contract",
-        "submit_w34_best_monitor_head_to_head.slurm",
-        (
-            "--mem=500G",
-            "--gres=gpu:5",
-            f"--mail-user={EMAIL}",
-            "EVAL_WORKERS=${EVAL_WORKERS:-5}",
-            "--checkpoint best_monitor",
-            "CUDA_VISIBLE_DEVICES=\"$gpu\"",
-            "exceedance_eval_w34_best_monitor",
-            "ens_head_to_head_best_monitor",
-            "ens_head_to_head_cycles",
-            "Checkpoint winner by HeatCast BSS then AUC",
-        ),
-    ))
-
-    for relative in (
-        "submit_w34_tube_all.slurm",
-        "submit_w34_eval_stitch.slurm",
-        "submit_w34_best_monitor_head_to_head.slurm",
-        "submit_ens_ingest.slurm",
-        "submit_ens_score_compare.slurm",
-        "submit_ens_widen_cycles.slurm",
-        "submit_slow_driver_opportunity.slurm",
-        "submit_teleconnection_stack_analysis.slurm",
-        "submit_paper_figures_tables.slurm",
-    ):
+    for relative in CURRENT_SUBMISSIONS:
         text = _text(root, relative)
         results.append(_result(
             f"submission.preflight.{relative}",
@@ -647,6 +540,16 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "repository.no_tracked_runtime_artifacts",
             not forbidden,
             "No model/data/runtime artifacts tracked" if not forbidden else f"Tracked runtime artifacts: {forbidden}",
+        ))
+        tracked_submissions = tuple(sorted(path for path in tracked if path.endswith(".slurm")))
+        results.append(_result(
+            "repository.current_submission_set",
+            tracked_submissions == CURRENT_SUBMISSIONS,
+            (
+                f"Tracked Slurm entry points are current: {tracked_submissions}"
+                if tracked_submissions == CURRENT_SUBMISSIONS
+                else f"Expected {CURRENT_SUBMISSIONS}; found {tracked_submissions}"
+            ),
         ))
     except (OSError, subprocess.CalledProcessError) as exc:
         results.append(_result("repository.no_tracked_runtime_artifacts", False, f"git ls-files failed: {exc}"))

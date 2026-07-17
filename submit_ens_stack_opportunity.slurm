@@ -24,7 +24,7 @@ DRIVER_ARGS=()
 if [ -n "${DRIVER_TABLE_DIR:-}" ]; then
   if [ ! -f "$DRIVER_TABLE_DIR/mjo_enso_by_init.npz" ]; then
     echo "Missing driver table: $DRIVER_TABLE_DIR/mjo_enso_by_init.npz"
-    echo "Build it first with submit_slow_driver_opportunity.slurm using ALLDATA_PATH and/or TELECONNECTION_INDEX_PATHS."
+    echo "Build it first with submit_teleconnection_stack_analysis.slurm or build_driver_tables.py."
     exit 1
   fi
   DRIVER_ARGS=(--driver_table_dir "$DRIVER_TABLE_DIR")

@@ -242,7 +242,7 @@ def main() -> None:
     combined = sorted(combined_labels)
     combined_path.write_text("\n".join(combined) + "\n", encoding="utf-8")
     print(f"Done: {len(combined)} unique hdates across cycles; combined labels in init_list.txt")
-    print("Next: submit submit_ens_ingest.slurm, then submit_ens_score_compare.slurm.")
+    print("Next: submit submit_ens_widen_cycles.slurm.")
 
 
 if __name__ == "__main__":

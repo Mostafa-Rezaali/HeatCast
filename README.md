@@ -1,340 +1,169 @@
 # HeatCast
 
-HeatCast is a GraphCast-style mesh GNN for CONUS warm-season T2max hindcasts.
-The current codebase focuses on direct day-15 prediction and experimental
-same-initialization multi-lead tube forecasting for `t+12...t+18`.
+HeatCast is a GraphCast-style mesh graph neural network for probabilistic
+CONUS week-3--4 (W34) warm-season T2max prediction. The current production
+model is the **HeatCast-W34 Distributional Mesh GNN**:
 
-The repository contains code and job scripts only. Training data, global fields,
-checkpoints, caches, hindcast outputs, plots, and proposal/personal artifacts are
-intentionally excluded from Git.
+- direct, single-pass inference rather than CFM sampling;
+- a 14-lead tube covering `t+15...t+28`;
+- a distributional head producing per-pixel mean and sigma;
+- Gaussian CRPS training;
+- five-fold, year-disjoint cross-validation; and
+- held-out calibration and evaluation for W34 q95 exceedance probabilities.
 
-## What This Model Does
+The model has 4,637,891 trainable parameters in the executed W34
+configuration. Training data, checkpoints, caches, generated tables, figures,
+movies, and manuscript working files are intentionally excluded from Git.
 
-HeatCast predicts daily PRISM T2max z-score fields over CONUS from local,
-global, static, seasonal, and teleconnection predictors.
+## Production Workflow
 
-The main production path is deterministic:
+The repository keeps one current Slurm entry point for each production stage.
 
-- Input: current and recent local CONUS fields, static features, teleconnection
-  indices, and coarse global atmospheric/ocean fields.
-- Backbone: GraphCast-style grid-to-mesh, mesh message passing, and mesh-to-grid
-  decoder on an icosahedral mesh.
-- Output: residual added to day-0 persistence.
-- Target: direct daily T2max at `t+15`.
-- Verification: daily TAC plus true 7-day mean TAC.
+| Stage | Submission |
+|---|---|
+| Train all five W34 folds | `submit_w34_tube_all.slurm` |
+| Evaluate, stitch, and save fold-safe arrays | `submit_w34_eval_stitch.slurm` |
+| Ingest and score ECMWF S2S cycles | `submit_ens_widen_cycles.slurm` |
+| Fit the paired HeatCast+ENS stack | `submit_ens_stack_opportunity.slurm` |
+| Add teleconnection and opportunity analyses | `submit_teleconnection_stack_analysis.slurm` |
+| Build paper evidence tables | `submit_paper_evidence_blocks.slurm` |
+| Build all journal figures and tables | `submit_paper_figures_journal.slurm` |
+| Export MATLAB-readable W34 NetCDF | `submit_export_w34_stack_netcdf.slurm` |
 
-The experimental tube path keeps the same CFM/GNN identity but predicts seven
-daily leads from one initialization:
+`submit_w34_tube_all.slurm` automatically submits
+`submit_w34_eval_stitch.slurm` after all folds complete. The evaluation
+defaults to the `best_monitor` checkpoint and accepts `CHECKPOINT_OVERRIDE`
+when an explicit alternative is required.
 
-```text
-t+12, t+13, t+14, t+15, t+16, t+17, t+18
-```
+## Core Code
 
-This supports same-init weekly verification by averaging the predicted daily
-tube instead of stitching neighboring independent initializations.
+| File | Purpose |
+|---|---|
+| `cfm_mesh_train.py` | Data setup, cross-validation, training, validation, and checkpoint handling |
+| `mesh_backbone.py` | Grid-to-mesh encoder, multimesh processor, decoder, tube attention, and distributional head |
+| `mode_dispatch.py` | Deterministic-direct mean/sigma semantics and Gaussian CRPS |
+| `icosahedral_mesh.py` | Icosahedral mesh and grid/mesh connectivity |
+| `exceedance_eval.py` | Daily/windowed q95 evaluation, calibration, leakage guards, and incremental arrays |
+| `stitch_exceedance_folds.py` | Cross-fitted five-fold out-of-sample stitching and year-block bootstrap |
+| `ens_ingest.py` | Resume-safe parallel ECMWF S2S ingestion and CONUS regridding |
+| `ens_score.py` | Fold-safe ENS bias correction, calibration, and scoring |
+| `ens_compare.py` | Matched HeatCast/ENS comparison and cycle merging |
+| `ens_heatcast_stack_opportunity.py` | Cross-fitted HeatCast+ENS stack and robustness analyses |
+| `build_driver_tables.py` | MJO, ENSO, soil, and teleconnection driver tables |
+| `forecasts_of_opportunity.py` | Driver/opportunity stratification and paired year bootstrap |
+| `build_paper_evidence_blocks.py` | Paper-facing mechanism, robustness, and operational tables |
+| `build_paper_figures_tables.py` | Primary probabilistic figures and tables |
+| `build_paper_figures_extended.py` | Spatial, reliability, case-study, and supporting figures |
+| `export_w34_stack_netcdf.py` | MATLAB NetCDF export with latitude x longitude x time fields |
+| `repo_integrity.py` | Fast data-free experiment and submission contract audit |
 
-## Repository Layout
+`Model_Inputs.txt` lists the local, vector, and global predictor channels.
 
-```text
-cfm_mesh_train.py                  Main training, validation, and hindcast export entry point
-mesh_backbone.py                   MeshFlowNet encoder-processor-decoder backbone
-mode_dispatch.py                   Deterministic and CFM/probabilistic loss/sample dispatch
-icosahedral_mesh.py                Icosahedral mesh construction and grid/mesh helpers
-stitch_hindcast_tac.py             Combine fold-level TAC sufficient statistics
-tac_skill_maps.py                  Generate TAC skill maps and regional summaries
-summarize_hindcast_diagnostics.py  Fold, monthly, regional diagnostic tables
-compute_baselines.py               Climatology, persistence, MeshFlowNet, optional ridge baselines
-export_per_year_stats.py           Per-year sufficient statistics for block bootstrap
-bootstrap_significance.py          Year-block bootstrap confidence intervals and p-values
-audit_fold2_light.py               Lightweight audit script for weak fold diagnostics
-validate_truth_slice.py            Validate suspicious target/truth slices
-ensemble_crps_analysis.py          Ensemble CRPS analysis utilities
-publication_analysis_utils.py      Shared publication-analysis helpers
-submit_weekly7_production.slurm    Production 5-fold daily model with weekly7 monitor
-submit_tube7_v1.slurm              Tube7 diagnostic/experimental run
-submit_per_year_bootstrap.slurm    Per-year export and bootstrap significance job
-submit_multiseed_ensemble.slurm    Multi-seed ensemble training/export job
-Model_Inputs.txt                   Input-channel reference
-```
+## W34 Training Contract
 
-## Data Requirements
-
-The code expects external NetCDF files on the HPC filesystem. These are not
-included in the repository.
-
-Default paths in `cfm_mesh_train.py`:
-
-```text
-/blue/nessie/mostafarezaali/Teleconnection/VDM_Training_Data_Extended_v2.nc
-/blue/nessie/mostafarezaali/Teleconnection/Global_Coarse_Conditions_Extended.nc
-/blue/nessie/mostafarezaali/Teleconnection/CONUS_topography_ETOPO2022_60s_on_model_grid.nc
-```
-
-Default output/cache root:
+The production training script fixes the executed experiment:
 
 ```text
-/blue/nessie/mostafarezaali/Teleconnection/
+prediction leads:        15,16,...,28
+tube loss:               0.80 daily CRPS + 0.20 14-day-mean CRPS
+distributional head:     enabled
+sigma floor:             0.1 z
+early-stop monitor:      tube_weekly7_tac
+cross-validation:        five year-disjoint folds
 ```
 
-If running somewhere else, update the paths in `Config` inside
-`cfm_mesh_train.py` or edit the corresponding `WORK_DIR` and data paths in the
-SLURM scripts.
+Despite the historical monitor name `tube_weekly7_tac`, the W34 script passes
+14 leads, so the monitored tube mean is the 14-day mean over `t+15...t+28`.
 
-## Inputs
+Run on HiPerGator:
 
-Local CONUS input has 19 channels:
+```bash
+cd /blue/nessie/mostafarezaali/Teleconnection
+sbatch submit_w34_tube_all.slurm
+```
 
-- `t2m_prism[t]`, `t2m_prism[t-1]`, `t2m_prism[t-2]`
-- local meteorological predictors at `t`
-- topography, latitude, longitude
-- day-of-year sine/cosine
-- TOA insolation
-- land mask
+The script requests eight B200 GPUs and 500 GB memory, resumes incomplete
+folds, and skips folds with a completed best-monitor checkpoint.
 
-Vector input has 5 teleconnection-index channels.
+## Exceedance Definition
 
-Global input currently uses 59 coarse/global fields, decomposed into:
+For initialization day `t`, continuous W34 truth and forecast are the means
+over leads `15...28`. The center month determines the threshold month.
 
-- trailing 20-day low-frequency component
-- current residual component
-
-This gives 118 global input channels when using one lag and two components.
-See `Model_Inputs.txt` for the full channel list.
-
-## Environment
-
-The production scripts are written for UF HiPerGator B200 nodes and assume:
-
-- CUDA module: `cuda/12.9.1`
-- Python/torch environment:
+The exceedance threshold is computed independently for each fold from training
+years only:
 
 ```text
-/blue/nessie/mostafarezaali/.conda/envs/torch_b200/
+q95_week[pixel, month] =
+    95th percentile of observed 14-day means for train-year initializations
 ```
 
-Core Python dependencies:
+Observed exceedance is `truth_week > q95_week`. Validation years fit
+calibration; test years report skill. Training, calibration, and test year
+sets are asserted disjoint.
 
-- `torch`
-- `torchmetrics`
-- `numpy`
-- `netCDF4`
-- `matplotlib`
-- `tqdm`
-- `scipy`
+## ENS And Stacking
 
-Optional analysis/figure dependencies used by some scripts:
+`submit_ens_widen_cycles.slurm` is the consolidated ENS ingestion and scoring
+workflow. It uses resume-safe parallel ingestion, cycle-specific quantile
+mapping, fold-safe calibration, and matched HeatCast test dates.
 
-- `Pillow`
-- `reportlab`
-- `openpyxl`
+The HeatCast+ENS stack is fit cross-fitted: each scored fold is excluded from
+its stacker fit. Comparisons use identical initialization dates, PRISM truth,
+q95 thresholds, land cells, and calendar-year bootstrap blocks.
 
-## Quick Sanity Check
+## Paper Outputs
 
-Run the repository integrity kit before training or evaluation:
+After the matched stack and teleconnection analyses complete:
+
+```bash
+sbatch submit_paper_evidence_blocks.slurm
+sbatch submit_paper_figures_journal.slurm
+```
+
+The journal wrapper runs both figure builders and is the only retained figure
+submission entry point. Generated outputs remain untracked.
+
+For MATLAB export:
+
+```bash
+sbatch submit_export_w34_stack_netcdf.slurm
+```
+
+The NetCDF contains continuous W34 truth/hindcast fields and probabilistic
+HeatCast, ENS, and stacked exceedance products.
+
+## Verification
+
+Run before every submission:
 
 ```bash
 python repo_integrity.py
 python -m pytest -q
 ```
 
-See `INTEGRITY_TEST_KIT.md` for the protected experiment contracts and limits
-of the data-free checks.
+The integrity audit checks the W34 lead window, distributional semantics,
+fold-safe evaluation, active Slurm contracts, current submission allowlist,
+ENS cycle handling, paper workflow, and absence of tracked runtime artifacts.
+See `INTEGRITY_TEST_KIT.md` for scope and limitations.
 
-From the HPC work directory:
+## Environment And External Data
 
-```bash
-python -m py_compile \
-  cfm_mesh_train.py mesh_backbone.py mode_dispatch.py icosahedral_mesh.py \
-  stitch_hindcast_tac.py tac_skill_maps.py summarize_hindcast_diagnostics.py \
-  compute_baselines.py export_per_year_stats.py bootstrap_significance.py
-
-python -c "import cfm_mesh_train; print('cfm_mesh_train import OK')"
-```
-
-## Production Run
-
-The current recommended production workflow is:
-
-```bash
-sbatch submit_weekly7_production.slurm
-```
-
-This runs all five cross-validation folds with:
-
-```bash
---deterministic
---epochs 30
---batch_size 1
---learning_rate 5e-5
---dropout 0.15
---warmup_epochs 10
---disable_anomaly_corr_loss
---early_stop_metric weekly7_tac
---early_stop_patience 5
---early_stop_min_epoch 12
-```
-
-It trains each fold, exports held-out test statistics, stitches the 5-fold
-hindcast, and writes diagnostic summaries.
-
-Main output locations:
+Production scripts target UF HiPerGator and use:
 
 ```text
-hindcast_stats/
-hindcast_paper_data/
-paper_figures/pub_weekly7/
-training_metrics/
-test_prediction_plots/
+/blue/nessie/mostafarezaali/Teleconnection
+/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
+CUDA 12.9.1 for model training/evaluation
 ```
 
-## Tube7 Experimental Run
+Primary external files are configured in `cfm_mesh_train.py`, including the
+PRISM/local training dataset, extended coarse global conditions, topography,
+and train-only normalization caches. ECMWF S2S GRIB data and teleconnection
+index sources are also external.
 
-The tube experiment predicts a seven-day daily target tube from one
-initialization:
+## Repository Policy
 
-```bash
-sbatch submit_tube7_v1.slurm
-```
-
-By default, the script runs fold 2 only:
-
-```bash
-FOLDS=${FOLDS:-"2"}
-```
-
-To run other folds:
-
-```bash
-FOLDS="0 1 2 3 4" sbatch submit_tube7_v1.slurm
-```
-
-The important flags are:
-
-```bash
---multi_lead_tube
---prediction_leads 12,13,14,15,16,17,18
---early_stop_metric tube_weekly7_tac
-```
-
-Tube loss:
-
-```text
-0.80 * mean_daily_MSE
-+0.10 * center_t+15_MSE
-+0.10 * same_init_weekly7_MSE
-```
-
-Use this as an experimental branch/config, not as a replacement for the
-production `pub_weekly7` run until it beats the production reference.
-
-## Hindcast Export
-
-A trained checkpoint can be exported manually:
-
-```bash
-torchrun --standalone --nproc_per_node=1 cfm_mesh_train.py \
-  --mode export_hindcast \
-  --deterministic \
-  --cv_fold 0 \
-  --run_name cvfold0_pub_weekly7 \
-  --checkpoint trained_cfm_direct15_cvfold0_pub_weekly7_best_monitor.pth \
-  --hindcast_splits test
-```
-
-For tube checkpoints, add:
-
-```bash
---multi_lead_tube \
---prediction_leads 12,13,14,15,16,17,18
-```
-
-Use `nproc_per_node=1` for paper-data export. Distributed export skips some
-sidecar paper-data products.
-
-## Stitching And Diagnostics
-
-Stitch fold-level statistics:
-
-```bash
-python -u stitch_hindcast_tac.py \
-  hindcast_stats/hindcast_tac_stats_cvfold*_pub_weekly7_test.npz \
-  --output hindcast_stats/stitched_5fold_tac_pub_weekly7.npz
-```
-
-Generate weekly7 skill maps:
-
-```bash
-python -u tac_skill_maps.py \
-  hindcast_stats/hindcast_tac_stats_cvfold*_pub_weekly7_test.npz \
-  --metric weekly7 \
-  --output_dir paper_figures/pub_weekly7
-```
-
-Summarize fold, month, and region diagnostics:
-
-```bash
-python -u summarize_hindcast_diagnostics.py \
-  hindcast_stats/hindcast_tac_stats_cvfold*_pub_weekly7_test.npz \
-  --monthly_glob "hindcast_paper_data/hindcast_monthly_stats_cvfold*_pub_weekly7_test.npz" \
-  --region_data paper_figures/pub_weekly7/tac_skill_maps_data.npz
-```
-
-Compute baseline table:
-
-```bash
-python -u compute_baselines.py \
-  hindcast_stats/hindcast_tac_stats_cvfold*_pub_weekly7_test.npz \
-  --paper_dir hindcast_paper_data \
-  --output_dir paper_figures/pub_weekly7
-```
-
-## Bootstrap Significance
-
-Per-year export and year-block bootstrap are heavier than the lightweight map
-scripts. Run them on a compute node:
-
-```bash
-sbatch submit_per_year_bootstrap.slurm
-```
-
-This writes:
-
-```text
-hindcast_stats/per_year_tac_stats_pub_weekly7.npz
-paper_figures/pub_weekly7/weekly7_bootstrap_results.npz
-```
-
-## Current Reference Result
-
-The `pub_weekly7` production run produced:
-
-```text
-Daily TAC:       model 0.0938, persistence 0.0767, skill +0.0170
-True weekly7 TAC: model 0.1632, persistence 0.1367, skill +0.0265
-```
-
-Year-block bootstrap for weekly7 skill:
-
-```text
-Skill 95% CI: [-0.0047, +0.0595]
-p-value:      0.0471
-```
-
-Interpret these as a benchmark-quality result, not a claim that the model wins
-in every fold, month, or region. The diagnostics intentionally report weak
-folds and seasonal/regional failures.
-
-## Git And Artifact Policy
-
-Do not commit:
-
-- NetCDF data
-- checkpoints
-- cache files
-- `.npy`, `.npz`, `.pkl`
-- generated figures
-- SLURM logs
-- proposal/personal documents
-- `node_modules`
-
-The `.gitignore` file is configured to keep the repository code-only.
+Commit source code, tests, active Slurm workflows, and concise documentation.
+Do not commit datasets, checkpoints, caches, generated results, manuscripts,
+meeting/presentation packs, figures, movies, logs, or personal proposal files.

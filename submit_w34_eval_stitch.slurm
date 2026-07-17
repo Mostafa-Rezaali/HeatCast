@@ -20,7 +20,7 @@ LEADS=15,16,17,18,19,20,21,22,23,24,25,26,27,28
 RUNS=cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold3_w34_dist_v1,cvfold4_w34_dist_v1
 INPUT_ROOT=exceedance_eval_incremental
 CHECKPOINT_CHOICE_FILE=${CHECKPOINT_CHOICE_FILE:-w34_checkpoint_choice.txt}
-CHECKPOINT_OVERRIDE=${CHECKPOINT_OVERRIDE:-}
+CHECKPOINT=${CHECKPOINT_OVERRIDE:-best_monitor}
 DRIVER_DIR=${DRIVER_DIR:-data_cache/slow_driver_tables_w34}
 FORCE_EVAL=${FORCE_EVAL:-0}
 
@@ -34,13 +34,8 @@ git pull --ff-only origin main
 "$PY" -m py_compile repo_integrity.py exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
 "$PY" repo_integrity.py
 
-if [ -n "$CHECKPOINT_OVERRIDE" ]; then
-    CHECKPOINT=$CHECKPOINT_OVERRIDE
-elif [ -f "$CHECKPOINT_CHOICE_FILE" ]; then
+if [ -z "${CHECKPOINT_OVERRIDE:-}" ] && [ -f "$CHECKPOINT_CHOICE_FILE" ]; then
     CHECKPOINT=$(tr -d '[:space:]' < "$CHECKPOINT_CHOICE_FILE")
-else
-    echo "Missing $CHECKPOINT_CHOICE_FILE. Run submit_w34_checkpoint_arbitration.slurm first."
-    exit 1
 fi
 case "$CHECKPOINT" in
     best_tac|best_monitor) ;;

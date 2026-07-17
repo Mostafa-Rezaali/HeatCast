@@ -39,11 +39,23 @@ submit_multiseed_*.slurm
 *.png
 *.jpg
 *.jpeg
+*.gif
+*.avi
 *.pptx
 *.docx
+*.vsdx
+*.drawio
+*.aux
 review_packet*/
 screen_capture*
 screen_crop*
+meeting_evidence/
+paper_findings_report/
+paper_figures_tables/
+paper_figures_extended/
+outputs/
+_review_*/
+.codex_tmp/
 
 # Personal/proposal working folders
 nsf_ags_prf_uploads/
@@ -57,5 +69,7 @@ Working_Version/
 Subdomain/
 files/
 2/
+Draft_Paper/
+JAMES_manuscript/
 
 .DS_Store

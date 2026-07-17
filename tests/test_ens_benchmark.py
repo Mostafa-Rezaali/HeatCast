@@ -321,7 +321,7 @@ def test_ens_score_reports_all_invalid_ingested_outputs(tmp_path: Path):
     assert "Found 2 invalid ingested ENS outputs" in message
     assert "init_20010701.npz" in message
     assert "init_20010702.npz" in message
-    assert "Rerun submit_ens_ingest.slurm" in message
+    assert "Rerun submit_ens_widen_cycles.slurm" in message
 
 
 def test_ens_quantile_mapping_requires_only_observed_valid_target_months():
@@ -344,20 +344,6 @@ def test_ens_quantile_mapping_cache_is_keyed_by_exact_training_init_set():
     assert '"mapping_init_indices" in data.files' in source
     assert 'np.array_equal(' in source
     assert 'data["mapping_init_indices"]' in source
-
-
-def test_ens_score_submission_runs_bounded_parallel_folds_before_compare():
-    script = (Path(__file__).resolve().parents[1] / "submit_ens_score_compare.slurm").read_text(
-        encoding="utf-8"
-    )
-    assert "FOLD_WORKERS=${FOLD_WORKERS:-2}" in script
-    assert 'score_fold "$FOLD" &' in script
-    assert "wait_for_fold_batch()" in script
-    assert 'if [ "${#PIDS[@]}" -ge "$FOLD_WORKERS" ]; then' in script
-    assert script.index("All ENS folds complete; starting pooled comparison") < script.index(
-        '"$PY" -u ens_compare.py'
-    )
-    assert "--weekdays" not in script
 
 
 def test_cycle_probabilities_merge_duplicates_without_double_counting():
@@ -410,20 +396,6 @@ def test_cycle_widen_submission_rescores_legacy_and_merges_by_year():
     assert "run_cycle rt2024" in script
     assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script
     assert "--emit_per_year" in script
-
-
-def test_best_monitor_head_to_head_runs_parallel_fold_arbitration():
-    script = (Path(__file__).resolve().parents[1] / "submit_w34_best_monitor_head_to_head.slurm").read_text(
-        encoding="utf-8"
-    )
-    assert "#SBATCH --gres=gpu:5" in script
-    assert "EVAL_WORKERS=${EVAL_WORKERS:-5}" in script
-    assert "--checkpoint best_monitor" in script
-    assert "CUDA_VISIBLE_DEVICES=\"$gpu\"" in script
-    assert "exceedance_eval_w34_best_monitor" in script
-    assert "ens_head_to_head_best_monitor" in script
-    assert "ens_head_to_head_cycles" in script
-    assert "Checkpoint winner by HeatCast BSS then AUC" in script
 
 
 def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
@@ -503,7 +475,7 @@ def test_teleconnection_stack_submission_is_cpu_only_and_explicit():
 def test_paper_figures_tables_package_is_cpu_only_and_records_claim_boundaries():
     root = Path(__file__).resolve().parents[1]
     source = (root / "build_paper_figures_tables.py").read_text(encoding="utf-8")
-    script = (root / "submit_paper_figures_tables.slurm").read_text(encoding="utf-8")
+    script = (root / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
     assert "figure_1_headline_skill" in source
     assert "figure_2_headline_stack_minus_ens_ci" in source
     assert "figure_3_robustness" in source
@@ -523,7 +495,7 @@ def test_paper_figures_tables_package_is_cpu_only_and_records_claim_boundaries()
     assert "--gres=gpu" not in script
     assert "module load cuda" not in script
     assert "--partition=hpg-b200" not in script
-    assert "--mem=32G" in script
+    assert "--mem=64G" in script
     assert "build_paper_figures_tables.py" in script
 
 
@@ -597,7 +569,7 @@ def test_extended_paper_flexible_ens_run_resolver_allows_mixed_templates(tmp_pat
 def test_extended_paper_submission_is_cpu_only_and_auditable():
     root = Path(__file__).resolve().parents[1]
     source = (root / "build_paper_figures_extended.py").read_text(encoding="utf-8")
-    script = (root / "submit_paper_figures_extended.slurm").read_text(encoding="utf-8")
+    script = (root / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
     assert "figure_5_spatial_skill" in source
     assert "figure_6_reliability_decomposition" in source
     assert "figure_7_case_studies" in source

@@ -101,6 +101,11 @@ Extended 50:
 58. `era5_tcwv`
 59. `era5_t2m`
 
-**Target, not input**
+**Targets and outputs, not inputs**
 
-- `t2m_prism[t+15]`, normalized with training-set mean/std.
+- Daily PRISM T2max z-score fields at leads `t+15` through `t+28`.
+- The distributional head emits a mean and positive sigma for every lead and
+  land pixel.
+- W34 continuous verification averages the 14 daily target and mean fields.
+- W34 exceedance truth compares that 14-day observed mean with a
+  train-year-only, center-month, per-pixel q95 threshold.
