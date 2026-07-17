@@ -14,7 +14,7 @@ jobs:
 
     runs-on: ubuntu-latest
     env:
-      HEATCAST_OUTPUT_DIR: ${{ runner.temp }}/HeatCast
+      HEATCAST_OUTPUT_DIR: /tmp/HeatCast
     strategy:
       fail-fast: false
       matrix:
