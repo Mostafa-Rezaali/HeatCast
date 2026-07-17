@@ -227,7 +227,10 @@ class Config:
     # ==================== DATA PATHS ====================
     TRAINING_DATA_PATH = '/blue/nessie/mostafarezaali/Teleconnection/VDM_Training_Data_Extended_v2.nc'
     TARGET_VARIABLE_CANDIDATES = ("t2m_prism", "HeatIndex")
-    OUTPUT_DIR = "/blue/nessie/mostafarezaali/Teleconnection/"
+    OUTPUT_DIR = os.environ.get(
+        "HEATCAST_OUTPUT_DIR",
+        "/blue/nessie/mostafarezaali/Teleconnection/",
+    )
     CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
     PLOTS_DIR = os.path.join(OUTPUT_DIR, "test_prediction_plots")
 
