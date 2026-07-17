@@ -31,8 +31,8 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 git pull --ff-only origin main
-"$PY" -m py_compile repo_integrity.py exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
-"$PY" repo_integrity.py
+"$PY" -m py_compile src/repo_integrity.py src/exceedance_eval.py src/stitch_exceedance_folds.py src/forecasts_of_opportunity.py
+"$PY" src/repo_integrity.py
 
 if [ -z "${CHECKPOINT_OVERRIDE:-}" ] && [ -f "$CHECKPOINT_CHOICE_FILE" ]; then
     CHECKPOINT=$(tr -d '[:space:]' < "$CHECKPOINT_CHOICE_FILE")
@@ -95,7 +95,7 @@ for FOLD in 0 1 2 3 4; do
         continue
     fi
     echo "Evaluating fold $FOLD: $RUN"
-    "$PY" -u exceedance_eval.py \
+    "$PY" -u src/exceedance_eval.py \
       --run_name "$RUN" \
       --cv_fold "$FOLD" \
       --checkpoint "$CHECKPOINT" \
@@ -113,7 +113,7 @@ for FOLD in 0 1 2 3 4; do
       --output_dir "$INPUT_ROOT"
 done
 
-"$PY" -u stitch_exceedance_folds.py \
+"$PY" -u src/stitch_exceedance_folds.py \
   --runs "$RUNS" \
   --window_leads "$LEADS" \
   --calibrator platt \
@@ -121,7 +121,7 @@ done
   --input_root "$INPUT_ROOT" \
   --bootstrap_reps 5000
 
-"$PY" -u forecasts_of_opportunity.py \
+"$PY" -u src/forecasts_of_opportunity.py \
   --input_root "$INPUT_ROOT" \
   --run_names "$RUNS" \
   --window_leads "$LEADS" \

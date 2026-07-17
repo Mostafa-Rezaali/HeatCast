@@ -20,14 +20,14 @@ W34_LEADS = tuple(range(15, 29))
 MJJAS_MONTHS = (5, 6, 7, 8, 9)
 EMAIL = "mostafarezaali@ufl.edu"
 CURRENT_SUBMISSIONS = (
-    "submit_ens_stack_opportunity.slurm",
-    "submit_ens_widen_cycles.slurm",
-    "submit_export_w34_stack_netcdf.slurm",
-    "submit_paper_evidence_blocks.slurm",
-    "submit_paper_figures_journal.slurm",
-    "submit_teleconnection_stack_analysis.slurm",
-    "submit_w34_eval_stitch.slurm",
-    "submit_w34_tube_all.slurm",
+    "slurm/submit_ens_stack_opportunity.slurm",
+    "slurm/submit_ens_widen_cycles.slurm",
+    "slurm/submit_export_w34_stack_netcdf.slurm",
+    "slurm/submit_paper_evidence_blocks.slurm",
+    "slurm/submit_paper_figures_journal.slurm",
+    "slurm/submit_teleconnection_stack_analysis.slurm",
+    "slurm/submit_w34_eval_stitch.slurm",
+    "slurm/submit_w34_tube_all.slurm",
 )
 
 
@@ -79,14 +79,14 @@ def audit_repository(root: Path) -> list[CheckResult]:
     root = root.resolve()
     results: list[CheckResult] = []
 
-    cfm = _text(root, "cfm_mesh_train.py")
-    exceed = _text(root, "exceedance_eval.py")
-    ens_ingest = _text(root, "ens_ingest.py")
-    ens_score = _text(root, "ens_score.py")
-    mode = _text(root, "mode_dispatch.py")
-    mesh = _text(root, "mesh_backbone.py")
-    w34_train = _text(root, "submit_w34_tube_all.slurm")
-    w34_eval = _text(root, "submit_w34_eval_stitch.slurm")
+    cfm = _text(root, "src/cfm_mesh_train.py")
+    exceed = _text(root, "src/exceedance_eval.py")
+    ens_ingest = _text(root, "src/ens_ingest.py")
+    ens_score = _text(root, "src/ens_score.py")
+    mode = _text(root, "src/mode_dispatch.py")
+    mesh = _text(root, "src/mesh_backbone.py")
+    w34_train = _text(root, "slurm/submit_w34_tube_all.slurm")
+    w34_eval = _text(root, "slurm/submit_w34_eval_stitch.slurm")
 
     month_literal = "MJJAS_MONTHS = (5, 6, 7, 8, 9)"
     results.append(_result(
@@ -137,7 +137,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "w34.training_contract",
-        "submit_w34_tube_all.slurm",
+        "slurm/submit_w34_tube_all.slurm",
         (
             "--gres=gpu:8",
             "--mem=500G",
@@ -150,14 +150,14 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "--sigma_floor 0.1",
             "--early_stop_metric tube_weekly7_tac",
             "--tube_loss_weekly_weight 0.20",
-            'sbatch --parsable submit_w34_eval_stitch.slurm',
+            'sbatch --parsable slurm/submit_w34_eval_stitch.slurm',
         ),
     ))
 
     results.append(_required_tokens_check(
         root,
         "w34.evaluation_contract",
-        "submit_w34_eval_stitch.slurm",
+        "slurm/submit_w34_eval_stitch.slurm",
         (
             "--gres=gpu:1",
             "--mem=500G",
@@ -177,7 +177,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "opportunity.paired_parent_tests",
-        "forecasts_of_opportunity.py",
+        "src/forecasts_of_opportunity.py",
         (
             "def paired_year_block_bootstrap_interactions(",
             "selection_parent",
@@ -190,7 +190,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "s2s.heatcast_ens_stack_opportunity_contract",
-        "ens_heatcast_stack_opportunity.py",
+        "src/ens_heatcast_stack_opportunity.py",
         (
             "heatcast_ens_stack",
             "crossfit_excluding_fold",
@@ -219,12 +219,12 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "s2s.stack_opportunity_submission_contract",
-        "submit_ens_stack_opportunity.slurm",
+        "slurm/submit_ens_stack_opportunity.slurm",
         (
             "--mem=500G",
             f"--mail-user={EMAIL}",
             "git pull --ff-only origin main",
-            "ens_heatcast_stack_opportunity.py",
+            "src/ens_heatcast_stack_opportunity.py",
             "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024",
             "--bootstrap_reps 5000",
             "--max_stack_samples_per_fold 500000",
@@ -241,12 +241,12 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "s2s.teleconnection_stack_submission_contract",
-        "submit_teleconnection_stack_analysis.slurm",
+        "slurm/submit_teleconnection_stack_analysis.slurm",
         (
             "--mem=500G",
             f"--mail-user={EMAIL}",
             "git pull --ff-only origin main",
-            '"$PY" repo_integrity.py',
+            '"$PY" src/repo_integrity.py',
             "TELECONNECTION_INDEX_PATHS=${TELECONNECTION_INDEX_PATHS:?",
             "data_cache/slow_driver_tables_w34_teleconnections",
             "ens_heatcast_stack_opportunity_teleconnections",
@@ -256,7 +256,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "TELECONNECTION STACK ANALYSIS COMPLETE",
         ),
     ))
-    tele_submit = _text(root, "submit_teleconnection_stack_analysis.slurm")
+    tele_submit = _text(root, "slurm/submit_teleconnection_stack_analysis.slurm")
     results.append(_result(
         "s2s.teleconnection_stack_cpu_only_submission",
         "--gres=gpu" not in tele_submit
@@ -264,7 +264,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         and "--partition=hpg-b200" not in tele_submit,
         "Teleconnection Stack-vs-ENS postprocessing is CPU-only and does not request B200 GPUs",
     ))
-    stack_submit = _text(root, "submit_ens_stack_opportunity.slurm")
+    stack_submit = _text(root, "slurm/submit_ens_stack_opportunity.slurm")
     results.append(_result(
         "s2s.stack_opportunity_cpu_only_submission",
         "--gres=gpu" not in stack_submit
@@ -276,7 +276,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "paper.evidence_blocks_contract",
-        "build_paper_evidence_blocks.py",
+        "src/build_paper_evidence_blocks.py",
         (
             "mechanism_block.csv",
             "robustness_block.csv",
@@ -293,16 +293,16 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "paper.evidence_blocks_submission_contract",
-        "submit_paper_evidence_blocks.slurm",
+        "slurm/submit_paper_evidence_blocks.slurm",
         (
             "--mem=16G",
             f"--mail-user={EMAIL}",
             "git pull --ff-only origin main",
-            "build_paper_evidence_blocks.py",
+            "src/build_paper_evidence_blocks.py",
             "paper_evidence_blocks/window_15-16-17-18-19-20-21-22-23-24-25-26-27-28",
         ),
     ))
-    evidence_submit = _text(root, "submit_paper_evidence_blocks.slurm")
+    evidence_submit = _text(root, "slurm/submit_paper_evidence_blocks.slurm")
     results.append(_result(
         "paper.evidence_blocks_cpu_only_submission",
         "--gres=gpu" not in evidence_submit
@@ -314,7 +314,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "paper.figures_tables_contract",
-        "build_paper_figures_tables.py",
+        "src/build_paper_figures_tables.py",
         (
             "figure_1_headline_skill",
             "figure_2_headline_stack_minus_ens_ci",
@@ -340,7 +340,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "paper.figures_extended_contract",
-        "build_paper_figures_extended.py",
+        "src/build_paper_figures_extended.py",
         (
             "figure_5_spatial_skill",
             "figure_6_reliability_decomposition",
@@ -363,19 +363,19 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "paper.figures_journal_submission_contract",
-        "submit_paper_figures_journal.slurm",
+        "slurm/submit_paper_figures_journal.slurm",
         (
             "--mem=64G",
             f"--mail-user={EMAIL}",
             "git pull --ff-only origin main",
             "figure_style.py",
-            "build_paper_figures_tables.py",
-            "build_paper_figures_extended.py",
+            "src/build_paper_figures_tables.py",
+            "src/build_paper_figures_extended.py",
             "--w34_log_glob",
             "OPENBLAS_NUM_THREADS=1",
         ),
     ))
-    journal_submit = _text(root, "submit_paper_figures_journal.slurm")
+    journal_submit = _text(root, "slurm/submit_paper_figures_journal.slurm")
     results.append(_result(
         "paper.figures_journal_cpu_only_submission",
         "--gres=gpu" not in journal_submit
@@ -399,7 +399,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "ENS ingestion opens and combines control and perturbed GRIB groups explicitly",
     ))
 
-    ens_ingest_submission = _text(root, "submit_ens_widen_cycles.slurm")
+    ens_ingest_submission = _text(root, "slurm/submit_ens_widen_cycles.slurm")
     results.append(_result(
         "s2s.parallel_ingest_contract",
         all(token in ens_ingest for token in (
@@ -421,7 +421,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "ENS ingestion uses bounded process parallelism and atomic resume-safe outputs",
     ))
 
-    download_s2s = _text(root, "download_ecmwf_s2s.py")
+    download_s2s = _text(root, "src/download_ecmwf_s2s.py")
     results.append(_result(
         "s2s.parallel_download_contract",
         "ThreadPoolExecutor(max_workers=int(args.workers))" in download_s2s
@@ -444,7 +444,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "s2s.score_rejects_corrupt_ingest_contract",
         "validate_ingested_output(path, window_leads)" in ens_score
         and "Found {len(invalid_files)} invalid ingested ENS outputs" in ens_score
-        and "Rerun submit_ens_widen_cycles.slurm" in ens_score,
+        and "Rerun slurm/submit_ens_widen_cycles.slurm" in ens_score,
         "ENS scoring rejects invalid ingested archives with a repair command",
     ))
 
@@ -476,7 +476,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Parallel ENS folds use read-only heat/time disk memmaps and skip shared global predictor caches",
     ))
 
-    ens_compare = _text(root, "ens_compare.py")
+    ens_compare = _text(root, "src/ens_compare.py")
     results.append(_result(
         "s2s.multicycle_widening_contract",
         all(token in ens_score for token in (
@@ -502,7 +502,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     results.append(_required_tokens_check(
         root,
         "s2s.multicycle_submission_contract",
-        "submit_ens_widen_cycles.slurm",
+        "slurm/submit_ens_widen_cycles.slurm",
         (
             "--mem=500G",
             "--gres=gpu:1",
@@ -522,7 +522,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         results.append(_result(
             f"submission.preflight.{relative}",
             "git pull --ff-only origin main" in text
-            and '"$PY" repo_integrity.py' in text,
+            and '"$PY" src/repo_integrity.py' in text,
             f"{relative}: pulls current code and runs repository integrity preflight",
         ))
 
@@ -557,7 +557,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     workflow = _text(root, ".github/workflows/python-package.yml")
     results.append(_result(
         "ci.runs_integrity_and_pytest",
-        "python repo_integrity.py" in workflow and "pytest" in workflow,
+        "python src/repo_integrity.py" in workflow and "pytest" in workflow,
         "GitHub Actions runs the contract audit and pytest",
     ))
     return results
@@ -565,7 +565,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default=Path(__file__).resolve().parent, type=Path)
+    parser.add_argument("--root", default=Path(__file__).resolve().parents[1], type=Path)
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     args = parser.parse_args()
 

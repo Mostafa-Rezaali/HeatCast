@@ -2,7 +2,7 @@ function make_w34_continuous_movie(ncFile, outMovie, varargin)
 %MAKE_W34_CONTINUOUS_MOVIE Plot continuous W34 z-score truth and hindcast fields.
 %
 % Usage:
-%   addpath('matlab_plots')
+%   addpath('matlab')
 %   make_w34_continuous_movie('matlab_exports/w34_heatcast_ens_stack.nc')
 %
 % This plots:
@@ -17,7 +17,7 @@ if nargin < 1 || isempty(ncFile)
     ncFile = fullfile('matlab_exports', 'w34_heatcast_ens_stack.nc');
 end
 if nargin < 2 || isempty(outMovie)
-    outMovie = fullfile('matlab_plots', 'outputs', 'w34_continuous_truth_hindcast_movie.mp4');
+    outMovie = fullfile('matlab', 'outputs', 'w34_continuous_truth_hindcast_movie.mp4');
 end
 
 make_w34_truth_hindcast_movie(ncFile, outMovie, ...

@@ -55,7 +55,7 @@ def load_fold_inputs(
     if not manifest_path.exists() or not calibration_path.exists() or not chunk_dir.is_dir():
         raise FileNotFoundError(
             f"Missing stitchable arrays for {run_name}: expected {manifest_path}, "
-            f"{calibration_path}, and {chunk_dir}. Rerun exceedance_eval.py for this fold with "
+            f"{calibration_path}, and {chunk_dir}. Rerun src/exceedance_eval.py for this fold with "
             "--incremental_skill_diagnostic --save_incremental_arrays."
         )
     with np.load(manifest_path, allow_pickle=False) as data:

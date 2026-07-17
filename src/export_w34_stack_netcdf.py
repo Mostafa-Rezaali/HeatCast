@@ -217,7 +217,7 @@ def assert_continuous_heatcast_chunks(heat_name: str, chunks: Sequence[Path]) ->
                 raise RuntimeError(
                     f"{heat_name}: stale incremental chunk lacks mu_z/truth_z: {path} "
                     f"(init_time_index={init_idx}, target_center_time_index={target_idx}). "
-                    "Rerun submit_w34_eval_stitch.slurm after pulling the schema-v2 code."
+                    "Rerun slurm/submit_w34_eval_stitch.slurm after pulling the schema-v2 code."
                 )
 
 
@@ -522,7 +522,7 @@ def write_netcdf(
                     f"Saved incremental chunk lacks continuous mu_z/truth_z fields "
                     f"(fold={record['fold']}, init_time_index={record['init_time_index']}, "
                     f"target_center_time_index={record['target_center_time_index']}). "
-                    "Rerun exceedance_eval.py with --incremental_skill_diagnostic --save_incremental_arrays "
+                    "Rerun src/exceedance_eval.py with --incremental_skill_diagnostic --save_incremental_arrays "
                     "after pulling the schema>=2 code."
                 )
             stack_prob = record["stacker"].predict_features(np.asarray(data["features"], dtype=np.float32))

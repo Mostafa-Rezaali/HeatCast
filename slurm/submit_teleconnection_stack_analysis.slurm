@@ -35,15 +35,15 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
 git pull --ff-only origin main
-"$PY" -m py_compile repo_integrity.py recover_chunk_init_dates.py build_driver_tables.py forecasts_of_opportunity.py ens_heatcast_stack_opportunity.py ens_compare.py exceedance_eval.py stitch_exceedance_folds.py
-"$PY" repo_integrity.py
+"$PY" -m py_compile src/repo_integrity.py src/recover_chunk_init_dates.py src/build_driver_tables.py src/forecasts_of_opportunity.py src/ens_heatcast_stack_opportunity.py src/ens_compare.py src/exceedance_eval.py src/stitch_exceedance_folds.py
+"$PY" src/repo_integrity.py
 
-"$PY" -u recover_chunk_init_dates.py \
+"$PY" -u src/recover_chunk_init_dates.py \
   --input_root "$INPUT_ROOT" \
   --run_names "$RUNS" \
   --window_leads "$LEADS"
 
-"$PY" -u build_driver_tables.py \
+"$PY" -u src/build_driver_tables.py \
   --rmm_path "$RMM_PATH" \
   --nino34_path "$NINO34_PATH" \
   --teleconnection_index_paths "$TELECONNECTION_INDEX_PATHS" \
@@ -53,7 +53,7 @@ git pull --ff-only origin main
   --window_leads "$LEADS" \
   --output_dir "$DRIVER_DIR"
 
-"$PY" -u forecasts_of_opportunity.py \
+"$PY" -u src/forecasts_of_opportunity.py \
   --input_root "$INPUT_ROOT" \
   --run_names "$RUNS" \
   --window_leads "$LEADS" \
@@ -61,7 +61,7 @@ git pull --ff-only origin main
   --bootstrap_axes "$BOOTSTRAP_AXES" \
   --n_bootstrap "$STRATUM_BOOTSTRAP_REPS"
 
-"$PY" -u ens_heatcast_stack_opportunity.py \
+"$PY" -u src/ens_heatcast_stack_opportunity.py \
   --heatcast_runs cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold3_w34_dist_v1,cvfold4_w34_dist_v1 \
   --ens_runs cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024 \
   --window_leads "$LEADS" \

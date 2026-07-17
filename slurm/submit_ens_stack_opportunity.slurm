@@ -24,7 +24,7 @@ DRIVER_ARGS=()
 if [ -n "${DRIVER_TABLE_DIR:-}" ]; then
   if [ ! -f "$DRIVER_TABLE_DIR/mjo_enso_by_init.npz" ]; then
     echo "Missing driver table: $DRIVER_TABLE_DIR/mjo_enso_by_init.npz"
-    echo "Build it first with submit_teleconnection_stack_analysis.slurm or build_driver_tables.py."
+    echo "Build it first with slurm/submit_teleconnection_stack_analysis.slurm or src/build_driver_tables.py."
     exit 1
   fi
   DRIVER_ARGS=(--driver_table_dir "$DRIVER_TABLE_DIR")
@@ -36,10 +36,10 @@ WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
 cd "$WORK_DIR"
 git pull --ff-only origin main
 
-"$PY" -m py_compile ens_heatcast_stack_opportunity.py ens_compare.py exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
-"$PY" repo_integrity.py
+"$PY" -m py_compile src/ens_heatcast_stack_opportunity.py src/ens_compare.py src/exceedance_eval.py src/stitch_exceedance_folds.py src/forecasts_of_opportunity.py
+"$PY" src/repo_integrity.py
 
-"$PY" -u ens_heatcast_stack_opportunity.py \
+"$PY" -u src/ens_heatcast_stack_opportunity.py \
   --heatcast_runs cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold3_w34_dist_v1,cvfold4_w34_dist_v1 \
   --ens_runs cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024 \
   --window_leads 15,16,17,18,19,20,21,22,23,24,25,26,27,28 \

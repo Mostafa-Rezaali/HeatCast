@@ -30,15 +30,15 @@ export OPENBLAS_NUM_THREADS=1
 cd "$WORK_DIR"
 git pull --ff-only origin main
 
-"$PY" -m py_compile figure_style.py build_paper_figures_tables.py build_paper_figures_extended.py repo_integrity.py
-"$PY" repo_integrity.py
+"$PY" -m py_compile src/figure_style.py src/build_paper_figures_tables.py src/build_paper_figures_extended.py src/repo_integrity.py
+"$PY" src/repo_integrity.py
 
-"$PY" -u build_paper_figures_tables.py \
+"$PY" -u src/build_paper_figures_tables.py \
   --stack_dir "ens_heatcast_stack_opportunity/${WINDOW}" \
   --evidence_dir "paper_evidence_blocks/${WINDOW}" \
   --output_dir "paper_figures_tables/${WINDOW}"
 
-"$PY" -u build_paper_figures_extended.py \
+"$PY" -u src/build_paper_figures_extended.py \
   --stack_dir "ens_heatcast_stack_opportunity/${WINDOW}" \
   --teleconnection_stack_dir "ens_heatcast_stack_opportunity_teleconnections/${WINDOW}" \
   --evidence_dir "paper_evidence_blocks/${WINDOW}" \

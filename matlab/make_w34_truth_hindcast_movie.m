@@ -33,7 +33,7 @@ if nargin < 1 || isempty(ncFile)
     ncFile = 'w34_heatcast_ens_stack.nc';
 end
 if nargin < 2 || isempty(outMovie)
-    outMovie = fullfile('matlab_plots', 'outputs', 'w34_truth_hindcast_movie.mp4');
+    outMovie = fullfile('matlab', 'outputs', 'w34_truth_hindcast_movie.mp4');
 end
 
 p = inputParser;
@@ -764,10 +764,10 @@ end
 
 candidates = {
     ncFile
-    fullfile('matlab_plots', [name ext])
+    fullfile('matlab', [name ext])
     fullfile('matlab_exports', [name ext])
     fullfile('.', [name ext])
-    fullfile('matlab_plots', 'w34_heatcast_ens_stack.nc')
+    fullfile('matlab', 'w34_heatcast_ens_stack.nc')
     fullfile('matlab_exports', 'w34_heatcast_ens_stack.nc')
     fullfile('.', 'w34_heatcast_ens_stack.nc')
     };
@@ -780,7 +780,7 @@ for i = 1:numel(candidates)
     end
 end
 
-matches = [dir('*.nc'); dir(fullfile('matlab_plots', '*.nc')); dir(fullfile('matlab_exports', '*.nc'))];
+matches = [dir('*.nc'); dir(fullfile('matlab', '*.nc')); dir(fullfile('matlab_exports', '*.nc'))];
 fprintf('Could not open requested NetCDF: %s\n', ncFile);
 if ~isempty(matches)
     fprintf('Available NetCDF candidates:\n');

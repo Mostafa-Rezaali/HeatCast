@@ -321,7 +321,7 @@ def test_ens_score_reports_all_invalid_ingested_outputs(tmp_path: Path):
     assert "Found 2 invalid ingested ENS outputs" in message
     assert "init_20010701.npz" in message
     assert "init_20010702.npz" in message
-    assert "Rerun submit_ens_widen_cycles.slurm" in message
+    assert "Rerun slurm/submit_ens_widen_cycles.slurm" in message
 
 
 def test_ens_quantile_mapping_requires_only_observed_valid_target_months():
@@ -339,7 +339,7 @@ def test_ens_quantile_mapping_requires_only_observed_valid_target_months():
 
 
 def test_ens_quantile_mapping_cache_is_keyed_by_exact_training_init_set():
-    source = (Path(__file__).resolve().parents[1] / "ens_score.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "src" / "ens_score.py").read_text(encoding="utf-8")
     assert 'mapping_init_indices=mapping_init_indices' in source
     assert '"mapping_init_indices" in data.files' in source
     assert 'np.array_equal(' in source
@@ -383,7 +383,7 @@ def test_cycle_run_templates_expand_per_fold():
 
 
 def test_cycle_widen_submission_rescores_legacy_and_merges_by_year():
-    script = (Path(__file__).resolve().parents[1] / "submit_ens_widen_cycles.slurm").read_text(
+    script = (Path(__file__).resolve().parents[1] / "slurm" / "submit_ens_widen_cycles.slurm").read_text(
         encoding="utf-8"
     )
     assert "INGEST_WORKERS=${INGEST_WORKERS:-16}" in script
@@ -400,8 +400,8 @@ def test_cycle_widen_submission_rescores_legacy_and_merges_by_year():
 
 def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     root = Path(__file__).resolve().parents[1]
-    source = (root / "ens_heatcast_stack_opportunity.py").read_text(encoding="utf-8")
-    script = (root / "submit_ens_stack_opportunity.slurm").read_text(encoding="utf-8")
+    source = (root / "src" / "ens_heatcast_stack_opportunity.py").read_text(encoding="utf-8")
+    script = (root / "slurm" / "submit_ens_stack_opportunity.slurm").read_text(encoding="utf-8")
     assert "heatcast_ens_stack" in source
     assert "crossfit_excluding_fold" in source
     assert "if int(other) != int(fold)" in source
@@ -440,8 +440,8 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
 
 def test_paper_evidence_blocks_are_cpu_only_and_cover_required_sections():
     root = Path(__file__).resolve().parents[1]
-    source = (root / "build_paper_evidence_blocks.py").read_text(encoding="utf-8")
-    script = (root / "submit_paper_evidence_blocks.slurm").read_text(encoding="utf-8")
+    source = (root / "src" / "build_paper_evidence_blocks.py").read_text(encoding="utf-8")
+    script = (root / "slurm" / "submit_paper_evidence_blocks.slurm").read_text(encoding="utf-8")
     assert "mechanism_block.csv" in source
     assert "robustness_block.csv" in source
     assert "operational_block.csv" in source
@@ -459,7 +459,7 @@ def test_paper_evidence_blocks_are_cpu_only_and_cover_required_sections():
 
 def test_teleconnection_stack_submission_is_cpu_only_and_explicit():
     root = Path(__file__).resolve().parents[1]
-    script = (root / "submit_teleconnection_stack_analysis.slurm").read_text(encoding="utf-8")
+    script = (root / "slurm" / "submit_teleconnection_stack_analysis.slurm").read_text(encoding="utf-8")
     assert "--mem=500G" in script
     assert "--gres=gpu" not in script
     assert "module load cuda" not in script
@@ -474,8 +474,8 @@ def test_teleconnection_stack_submission_is_cpu_only_and_explicit():
 
 def test_paper_figures_tables_package_is_cpu_only_and_records_claim_boundaries():
     root = Path(__file__).resolve().parents[1]
-    source = (root / "build_paper_figures_tables.py").read_text(encoding="utf-8")
-    script = (root / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
+    source = (root / "src" / "build_paper_figures_tables.py").read_text(encoding="utf-8")
+    script = (root / "slurm" / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
     assert "figure_1_headline_skill" in source
     assert "figure_2_headline_stack_minus_ens_ci" in source
     assert "figure_3_robustness" in source
@@ -568,8 +568,8 @@ def test_extended_paper_flexible_ens_run_resolver_allows_mixed_templates(tmp_pat
 
 def test_extended_paper_submission_is_cpu_only_and_auditable():
     root = Path(__file__).resolve().parents[1]
-    source = (root / "build_paper_figures_extended.py").read_text(encoding="utf-8")
-    script = (root / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
+    source = (root / "src" / "build_paper_figures_extended.py").read_text(encoding="utf-8")
+    script = (root / "slurm" / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
     assert "figure_5_spatial_skill" in source
     assert "figure_6_reliability_decomposition" in source
     assert "figure_7_case_studies" in source
@@ -592,10 +592,10 @@ def test_extended_paper_submission_is_cpu_only_and_auditable():
 
 def test_journal_figure_style_contract_and_submission_wrapper():
     root = Path(__file__).resolve().parents[1]
-    style = (root / "figure_style.py").read_text(encoding="utf-8")
-    tables = (root / "build_paper_figures_tables.py").read_text(encoding="utf-8")
-    extended = (root / "build_paper_figures_extended.py").read_text(encoding="utf-8")
-    script = (root / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
+    style = (root / "src" / "figure_style.py").read_text(encoding="utf-8")
+    tables = (root / "src" / "build_paper_figures_tables.py").read_text(encoding="utf-8")
+    extended = (root / "src" / "build_paper_figures_extended.py").read_text(encoding="utf-8")
+    script = (root / "slurm" / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
     assert "SYSTEM_COLORS" in style
     assert "save_figure" in style
     assert "svg.fonttype" in style and '"none"' in style
@@ -748,7 +748,7 @@ def test_extended_table8_replaces_fold2_sensitivity_with_base_rate_rows(tmp_path
 
 
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():
-    source = (Path(__file__).resolve().parents[1] / "download_ecmwf_s2s.py").read_text(
+    source = (Path(__file__).resolve().parents[1] / "src" / "download_ecmwf_s2s.py").read_text(
         encoding="utf-8"
     )
     assert "ThreadPoolExecutor(max_workers=int(args.workers))" in source

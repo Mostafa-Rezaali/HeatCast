@@ -5,7 +5,7 @@ This folder contains MATLAB scripts for plotting HeatCast W34 NetCDF exports.
 Continuous W34 z-score movie:
 
 ```matlab
-addpath('matlab_plots')
+addpath('matlab')
 make_w34_truth_hindcast_movie('matlab_exports/w34_heatcast_ens_stack.nc', [], ...
     'Mode','continuous')
 ```
@@ -16,14 +16,14 @@ hindcast on the right. Both are 14-day mean z-score fields.
 Exceedance-probability movie:
 
 ```matlab
-addpath('matlab_plots')
+addpath('matlab')
 make_w34_exceedance_movie('matlab_exports/w34_heatcast_ens_stack.nc')
 ```
 
 For a shorter interactive run with a pause after each plotted frame:
 
 ```matlab
-addpath('matlab_plots')
+addpath('matlab')
 runShort = make_w34_exceedance_movie('matlab_exports/w34_heatcast_ens_stack.nc', [], ...
     'FrameStep',14, ...
     'FramePauseSeconds',0.05);

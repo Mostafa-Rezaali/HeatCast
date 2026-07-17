@@ -54,6 +54,8 @@ paper_findings_report/
 paper_figures_tables/
 paper_figures_extended/
 outputs/
+matlab/outputs/
+matlab_plots/
 _review_*/
 .codex_tmp/
 

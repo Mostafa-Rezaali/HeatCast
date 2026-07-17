@@ -1421,7 +1421,7 @@ def copy_inputs_to_repro(root: Path, out_dir: Path, args: argparse.Namespace) ->
         if source.exists():
             shutil.copy2(source, repro / source.name)
     for script in ("submit_paper_figures_journal.slurm",):
-        path = root / script
+        path = root / "slurm" / script
         if path.exists():
             shutil.copy2(path, repro / script)
 

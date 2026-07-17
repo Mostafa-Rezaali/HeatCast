@@ -1,3 +1,5 @@
+# HeatCast Model Inputs
+
 The model call is:
 
 ```python

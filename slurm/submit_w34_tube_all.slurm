@@ -27,8 +27,8 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 git pull --ff-only origin main
-"$PY" -m py_compile repo_integrity.py cfm_mesh_train.py mesh_backbone.py mode_dispatch.py exceedance_eval.py
-"$PY" repo_integrity.py
+"$PY" -m py_compile src/repo_integrity.py src/cfm_mesh_train.py src/mesh_backbone.py src/mode_dispatch.py src/exceedance_eval.py
+"$PY" src/repo_integrity.py
 
 fold_training_complete() {
     local run=$1
@@ -62,7 +62,7 @@ for FOLD in 0 1 2 3 4; do
     fi
     rm -rf /dev/shm/cfm_cache
 
-    "$TORCHRUN" --standalone --nproc_per_node=8 cfm_mesh_train.py \
+    "$TORCHRUN" --standalone --nproc_per_node=8 src/cfm_mesh_train.py \
       --mode "$TRAIN_MODE" \
       "${CHECKPOINT_ARGS[@]}" \
       --deterministic \
@@ -99,5 +99,5 @@ done
 
 echo "ALL FIVE FOLDS COMPLETE"
 
-EVAL_JOB_ID=$(sbatch --parsable submit_w34_eval_stitch.slurm)
+EVAL_JOB_ID=$(sbatch --parsable slurm/submit_w34_eval_stitch.slurm)
 echo "Submitted W34 evaluation/stitch job: $EVAL_JOB_ID"

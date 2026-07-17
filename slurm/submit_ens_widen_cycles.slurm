@@ -33,10 +33,10 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 git pull --ff-only origin main
-"$PY" -m py_compile repo_integrity.py ens_common.py ens_ingest.py ens_score.py ens_compare.py
-"$PY" repo_integrity.py
+"$PY" -m py_compile src/repo_integrity.py src/ens_common.py src/ens_ingest.py src/ens_score.py src/ens_compare.py
+"$PY" src/repo_integrity.py
 
-"$PY" -u ens_ingest.py \
+"$PY" -u src/ens_ingest.py \
   --raw_dir ens_reforecast/raw \
   --rt_tag rt2024 \
   --variable mx2t6 \
@@ -59,7 +59,7 @@ score_fold_cycle() {
         return 0
     fi
     rm -rf "$out_dir"
-    "$PY" -u ens_score.py \
+    "$PY" -u src/ens_score.py \
       --cv_fold "$fold" \
       --run_name "$run" \
       --window_leads "$LEADS" \
@@ -101,7 +101,7 @@ run_cycle ""
 echo "Scoring rt2024 with cycle-specific quantile mappings."
 run_cycle rt2024
 
-"$PY" -u ens_compare.py \
+"$PY" -u src/ens_compare.py \
   --heatcast_runs "$HEATCAST_RUNS" \
   --ens_runs "$ENS_RUN_TEMPLATES" \
   --window_leads "$LEADS" \

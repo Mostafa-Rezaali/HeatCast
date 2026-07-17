@@ -22,13 +22,13 @@ not merely that Python files compile.
 Fast contract audit, suitable before every commit or Slurm submission:
 
 ```bash
-python repo_integrity.py
+python src/repo_integrity.py
 ```
 
 Machine-readable audit:
 
 ```bash
-python repo_integrity.py --json
+python src/repo_integrity.py --json
 ```
 
 Complete data-free test kit:
@@ -40,7 +40,7 @@ python -m pytest -q
 Undefined-name and syntax checks:
 
 ```bash
-python -m py_compile repo_integrity.py cfm_mesh_train.py mesh_backbone.py mode_dispatch.py exceedance_eval.py
+python -m py_compile src/repo_integrity.py src/cfm_mesh_train.py src/mesh_backbone.py src/mode_dispatch.py src/exceedance_eval.py
 git ls-files -z '*.py' | xargs -0 python -m flake8 --count --select=E9,F63,F7,F82 --show-source --statistics
 ```
 

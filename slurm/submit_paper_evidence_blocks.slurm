@@ -21,10 +21,10 @@ WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
 cd "$WORK_DIR"
 git pull --ff-only origin main
 
-"$PY" -m py_compile build_paper_evidence_blocks.py
-"$PY" repo_integrity.py
+"$PY" -m py_compile src/build_paper_evidence_blocks.py
+"$PY" src/repo_integrity.py
 
-"$PY" -u build_paper_evidence_blocks.py \
+"$PY" -u src/build_paper_evidence_blocks.py \
   --stack_dir ens_heatcast_stack_opportunity/window_15-16-17-18-19-20-21-22-23-24-25-26-27-28 \
   --opportunity_dir exceedance_eval_incremental/opportunity_window_15-16-17-18-19-20-21-22-23-24-25-26-27-28 \
   --output_dir paper_evidence_blocks/window_15-16-17-18-19-20-21-22-23-24-25-26-27-28

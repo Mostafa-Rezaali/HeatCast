@@ -29,6 +29,6 @@ CORE_SCRIPTS = (
 
 
 def test_core_scripts_compile():
-    repo_root = Path(__file__).resolve().parents[1]
+    source_root = Path(__file__).resolve().parents[1] / "src"
     for script in CORE_SCRIPTS:
-        py_compile.compile(str(repo_root / script), doraise=True)
+        py_compile.compile(str(source_root / script), doraise=True)

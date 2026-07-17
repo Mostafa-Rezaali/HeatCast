@@ -25,10 +25,10 @@ export OPENBLAS_NUM_THREADS=1
 cd "$WORK_DIR"
 git pull --ff-only origin main
 
-"$PY" -m py_compile export_w34_stack_netcdf.py repo_integrity.py
-"$PY" repo_integrity.py
+"$PY" -m py_compile src/export_w34_stack_netcdf.py src/repo_integrity.py
+"$PY" src/repo_integrity.py
 
-"$PY" -u export_w34_stack_netcdf.py \
+"$PY" -u src/export_w34_stack_netcdf.py \
   --output "$OUT" \
   --window_leads "$WINDOW_LEADS" \
   --heatcast_runs cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold3_w34_dist_v1,cvfold4_w34_dist_v1 \
